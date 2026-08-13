@@ -188,7 +188,7 @@ while [ $# -gt 0 ]; do
         enterprise)
             EDITION="Enterprise"
             EDITION_TAG="enterprise"
-            if [ "${INFLUXDB_VERSION_FLAG_SET}" == "0" ]; then
+            if [ "${INFLUXDB_VERSION_FLAG_SET}" = "0" ]; then
                 INFLUXDB_VERSION="${INFLUXDB_ENT_VERSION}"
             fi
             shift 1
