@@ -177,9 +177,36 @@ INFLUXDB_VERSION="${INFLUXDB_OSS_VERSION}"
 # SECTION 2: COMMAND LINE ARGUMENT PARSING
 # ==============================================================================
 
+print_usage() {
+    printf "Usage: %s [enterprise] [--version VERSION]\n" "$0"
+    printf "  enterprise: Install the Enterprise edition (optional)\n"
+    printf "  --version VERSION: Specify InfluxDB version (default: %s)\n" "$INFLUXDB_VERSION"
+}
+
+NEWLINE='
+'
+
+is_valid_version() {
+    case "$1" in
+        *"${NEWLINE}"*) return 1 ;;
+        1.*|2.*) return 1 ;;  # Only InfluxDB3 supported
+    esac
+    printf '%s' "$1" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'
+}
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --version)
+            if [ $# -lt 2 ] || [ -z "$2" ]; then
+                printf "Error: --version requires a value (e.g. --version %s)\n\n" "$INFLUXDB_VERSION" >&2
+                print_usage >&2
+                exit 1
+            fi
+            if ! is_valid_version "$2"; then
+                printf "Error: invalid version '%s'. Expected a final release in the form 3.Y.Z (e.g. 3.12.0)\n\n" "$2" >&2
+                print_usage >&2
+                exit 1
+            fi
             INFLUXDB_VERSION="$2"
             INFLUXDB_VERSION_FLAG_SET=1
             shift 2
@@ -193,9 +220,7 @@ while [ $# -gt 0 ]; do
             shift 1
             ;;
         *)
-            printf "Usage: %s [enterprise] [--version VERSION]\n" "$0"
-            printf "  enterprise: Install the Enterprise edition (optional)\n"
-            printf "  --version VERSION: Specify InfluxDB version (default: %s)\n" "$INFLUXDB_VERSION"
+            print_usage >&2
             exit 1
             ;;
     esac
