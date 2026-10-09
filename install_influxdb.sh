@@ -348,6 +348,35 @@ check_release_url() {
     esac
 }
 
+# --- Version Capabilities ---
+
+# Returns 0 if dotted version $1 is numerically $2 or later
+version_at_least() {
+    have="$1"
+    want="$2"
+    while [ -n "$have" ] || [ -n "$want" ]; do
+        have_field="${have%%.*}"
+        want_field="${want%%.*}"
+        if [ "${have_field:-0}" -gt "${want_field:-0}" ]; then
+            return 0
+        fi
+        if [ "${have_field:-0}" -lt "${want_field:-0}" ]; then
+            return 1
+        fi
+        case "$have" in *.*) have="${have#*.}" ;; *) have="" ;; esac
+        case "$want" in *.*) want="${want#*.}" ;; *) want="" ;; esac
+    done
+    return 0
+}
+
+# Returns 0 if EDITION and INFLUXDB_VERSION embed the Explorer UI (Enterprise 3.11.0+)
+has_embedded_ui() {
+    if [ "$EDITION" != "Enterprise" ]; then
+        return 1
+    fi
+    version_at_least "$INFLUXDB_VERSION" "3.11.0"
+}
+
 # --- Browser Integration ---
 
 # Utility function to open URL in browser
