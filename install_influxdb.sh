@@ -24,6 +24,9 @@
 #      - Extracts to user home directory (~/.influxdb)
 #      - Auto-configures shell PATH environment
 #      - Offers Quick Start, Custom, or Install-Only modes
+#      - Enterprise 3.11.0+ starts with the embedded Explorer UI
+#        (--mode=all,webui), creates the operator token, and saves both the
+#        UI session secret and the token under ~/.influxdb
 #
 # DIRECTORY STRUCTURE:
 #   Shared data directory (both installation methods):
@@ -42,7 +45,11 @@
 #   Binary specific:
 #     ~/.influxdb/
 #       ├── influxdb3              (Main binary)
-#       └── logs/                  (Timestamped server logs)
+#       ├── logs/                  (Timestamped server logs)
+#       ├── webui-session-secret   (Enterprise 3.11.0+: embedded Explorer UI
+#       │                           session secret, mode 600, reused on re-run)
+#       └── operator-token         (Enterprise 3.11.0+: operator token created
+#                                   at first startup, mode 600)
 #
 # REQUIREMENTS/PREREQUISITES:
 #   Core Requirements:
@@ -71,6 +78,9 @@
 #     - Overwrites any existing binary at ~/.influxdb/influxdb3
 #     - Preserves data directory (~/.influxdb/data) automatically
 #     - User can run script repeatedly to upgrade to latest version
+#     - Reuses the Explorer session secret, so a re-run does not sign
+#       browsers out; a token the server already has is read from the
+#       saved copy
 #
 # CONFIGURATION OPTIONS:
 #   Command Line Arguments:
@@ -122,6 +132,16 @@
 #     - Validates checksums before extraction
 #     - Automatically adds installation path to shell rc file
 #
+#   Binary Embedded UI (Enterprise 3.11.0+):
+#     - Every startup choice, including Skip, loads or creates the session
+#       secret file so the displayed serve command is real
+#     - The secret reaches the server through INFLUXDB3_WEBUI_SESSION_SECRET,
+#       not a flag, so it is absent from the process list; displayed commands
+#       show it as "$(cat ~/.influxdb/webui-session-secret)"
+#     - The operator token is created after the health check, printed once,
+#       then saved; the UI runs inside the server, so the server URL to add
+#       in it is the same http://localhost:<port> the browser uses
+#
 #   Docker Compose:
 #     - Creates internal network (influxdb-network) for service communication
 #     - Configures the Explorer container to reach InfluxDB by container name
@@ -136,6 +156,9 @@
 #
 #   Health Checking:
 #     - InfluxDB (Docker): Waits for "startup time:" in container logs
+#     - InfluxDB (Binary): Polls /health until it answers; any HTTP response,
+#       including 401 when the server requires a token, means the listener
+#       is up, and the UI is loaded before the listener starts
 #     - Explorer container: Polls /api/health endpoint for "ok/status/healthy"
 #     - Embedded UI: One request on / after the InfluxDB check; the result only
 #       selects the summary wording and whether the browser opens
@@ -178,6 +201,9 @@ OS=""
 INSTALL_LOC=~/.influxdb
 BINARY_NAME="influxdb3"
 PORT=8181
+# Script-owned files for the embedded Explorer UI (Enterprise 3.11.0+ binary)
+WEBUI_SECRET_FILE="$INSTALL_LOC/webui-session-secret"
+OPERATOR_TOKEN_FILE="$INSTALL_LOC/operator-token"
 
 # Set the default (latest) version here. Users may specify a version using the
 # --version arg (handled below)
@@ -678,8 +704,12 @@ wait_for_explorer_ready() {
 # --- Token Management ---
 
 # Utility function to create operator token via API
+# Parameters:
+#   $1 - container name (Docker path; empty on the binary path)
+#   $2 - port to call; defaults to the Docker host port
 create_operator_token() {
     CONTAINER_NAME="$1"
+    TOKEN_PORT="${2:-$INFLUXDB_PORT}"
 
     # Try API with retries
     MAX_RETRIES=3
@@ -687,7 +717,7 @@ create_operator_token() {
     TOKEN=""
 
     while [ $RETRY -lt $MAX_RETRIES ] && [ -z "$TOKEN" ]; do
-        TOKEN_RESPONSE=$(curl -s -w "\n%{http_code}" -m 5 -X POST http://localhost:$INFLUXDB_PORT/api/v3/configure/token/admin 2>&1)
+        TOKEN_RESPONSE=$(curl -s -w "\n%{http_code}" -m 5 -X POST http://localhost:$TOKEN_PORT/api/v3/configure/token/admin 2>&1)
 
         # Extract HTTP status code (last line)
         HTTP_CODE=$(echo "$TOKEN_RESPONSE" | tail -n1)
@@ -1464,6 +1494,10 @@ perform_server_health_check() {
             break
         fi
 
+        # Deliberately without -f: any HTTP answer, including the 401 that a
+        # server requiring a token returns, means the listener is up. The
+        # embedded UI is loaded before the listener starts, so nothing more
+        # is needed before the smoke check on /.
         if curl --max-time 1 -s "http://localhost:$PORT/health" >/dev/null 2>&1; then
             printf "\n${BOLDGREEN}✓ InfluxDB 3 ${EDITION} is now installed and running on port %s. Nice!${NC}\n" "$PORT"
             SUCCESS=1
@@ -1514,12 +1548,18 @@ display_enterprise_server_command() {
     if [ "$is_quick_start" = "true" ]; then
         # Quick Start format
         printf "└─${DIM} Command: ${NC}\n"
+        if [ "$USE_EMBEDDED_UI" = true ]; then
+            printf "${DIM}   INFLUXDB3_WEBUI_SESSION_SECRET=\"\$(cat '%s')\" \\\\${NC}\n" "$WEBUI_SECRET_FILE"
+        fi
         printf "${DIM}   influxdb3 serve \\\\${NC}\n"
         printf "${DIM}   --cluster-id=%s \\\\${NC}\n" "$CLUSTER_ID"
         printf "${DIM}   --node-id=%s \\\\${NC}\n" "$NODE_ID"
         if [ -n "$LICENSE_TYPE" ] && [ -n "$LICENSE_EMAIL" ]; then
             printf "${DIM}   --license-type=%s \\\\${NC}\n" "$LICENSE_TYPE"
             printf "${DIM}   --license-email=%s \\\\${NC}\n" "$LICENSE_EMAIL"
+        fi
+        if [ "$USE_EMBEDDED_UI" = true ]; then
+            printf "${DIM}   --mode=all,webui \\\\${NC}\n"
         fi
         printf "${DIM}   --http-bind=0.0.0.0:%s \\\\${NC}\n" "$PORT"
         printf "${DIM}   %s${NC}\n" "$STORAGE_FLAGS_ECHO"
@@ -1528,14 +1568,140 @@ display_enterprise_server_command() {
         # Custom configuration format
         printf "│\n"
         printf "├─ Running serve command:\n"
+        if [ "$USE_EMBEDDED_UI" = true ]; then
+            printf "├─${DIM} INFLUXDB3_WEBUI_SESSION_SECRET=\"\$(cat '%s')\" \\\\${NC}\n" "$WEBUI_SECRET_FILE"
+        fi
         printf "├─${DIM} influxdb3 serve \\\\${NC}\n"
         printf "├─${DIM} --cluster-id='%s' \\\\${NC}\n" "$CLUSTER_ID"
         printf "├─${DIM} --node-id='%s' \\\\${NC}\n" "$NODE_ID"
         printf "├─${DIM} --license-type='%s' \\\\${NC}\n" "$LICENSE_TYPE"
         printf "├─${DIM} --license-email='%s' \\\\${NC}\n" "$LICENSE_EMAIL"
+        if [ "$USE_EMBEDDED_UI" = true ]; then
+            printf "├─${DIM} --mode='all,webui' \\\\${NC}\n"
+        fi
         printf "├─${DIM} --http-bind='0.0.0.0:%s' \\\\${NC}\n" "$PORT"
         printf "├─${DIM} %s${NC}\n" "$STORAGE_FLAGS_ECHO"
         printf "│\n"
+    fi
+}
+
+# Function to display the Enterprise serve command for a manual start, with
+# defaults for anything the user has not chosen yet (troubleshooting after a
+# failed startup, and Skip startup)
+display_enterprise_manual_command() {
+    if [ "$USE_EMBEDDED_UI" = true ]; then
+        printf "     INFLUXDB3_WEBUI_SESSION_SECRET=\"\$(cat '%s')\" \\\\\n" "$WEBUI_SECRET_FILE"
+    fi
+    printf "     influxdb3 serve \\\\\n"
+    printf "     --cluster-id=%s \\\\\n" "${CLUSTER_ID:-cluster0}"
+    printf "     --node-id=%s \\\\\n" "${NODE_ID:-node0}"
+    printf "     --license-type=%s \\\\\n" "${LICENSE_TYPE:-trial}"
+    printf "     --license-email=%s \\\\\n" "${LICENSE_EMAIL:-your@email.com}"
+    if [ "$USE_EMBEDDED_UI" = true ]; then
+        # The UI URL printed alongside names this port, so the command binds
+        # it. Older versions keep the baseline command, which omits the bind.
+        printf "     --mode=all,webui \\\\\n"
+        printf "     --http-bind=0.0.0.0:%s \\\\\n" "$PORT"
+    fi
+    printf "     %s\n" "${STORAGE_FLAGS_ECHO:-"--object-store=file --data-dir $INSTALL_LOC/data --plugin-dir $INSTALL_LOC/plugins"}"
+}
+
+# --- Embedded Explorer UI (Enterprise 3.11.0+) ---
+
+# Write $2 to $1 as a file readable only by its owner
+# Returns: 1 when the file cannot be written
+write_private_file() {
+    # umask protects a new file; chmod covers an existing one
+    (
+        umask 077
+        printf '%s\n' "$2" > "$1"
+    ) && chmod 600 "$1"
+}
+
+# Load the embedded UI session secret from the script-owned file, creating
+# the file when it is missing, and export the secret for the server launch.
+# The server requires a secret whenever webui is on. It is passed through the
+# environment, not a flag, so it does not appear in the process list, and it
+# is reused on every run so that a re-run does not sign browsers out.
+# Exits: 1 when the file cannot be written
+load_webui_session_secret() {
+    WEBUI_SESSION_SECRET=""
+    if [ -f "$WEBUI_SECRET_FILE" ]; then
+        WEBUI_SESSION_SECRET=$(cat "$WEBUI_SECRET_FILE" 2>/dev/null) || WEBUI_SESSION_SECRET=""
+    fi
+    if [ -z "$WEBUI_SESSION_SECRET" ]; then
+        WEBUI_SESSION_SECRET=$(generate_session_secret)
+        if ! write_private_file "$WEBUI_SECRET_FILE" "$WEBUI_SESSION_SECRET"; then
+            printf "\n${RED}Error:${NC} Could not write the Explorer session secret to '%s'.\n" "$WEBUI_SECRET_FILE" >&2
+            exit 1
+        fi
+    fi
+    export INFLUXDB3_WEBUI_SESSION_SECRET="$WEBUI_SESSION_SECRET"
+}
+
+# Create the operator token after the health check, print it once, then save
+# it. On HTTP 409 the server already has a token this run never saw, and
+# regenerating one needs the existing token, so a copy saved by an earlier
+# run is the only fallback. That copy may belong to another cluster or data
+# directory, so it counts only when this server accepts it.
+# Sets: TOKEN, TOKEN_OK (a usable token is known), TOKEN_SAVED (it is on disk)
+create_binary_operator_token() {
+    TOKEN_OK=false
+    TOKEN_SAVED=false
+
+    printf "\n${BOLD}Creating operator token${NC}\n"
+    TOKEN=$(create_operator_token "" "$PORT") || true
+    case "$TOKEN" in
+        TOKEN_ALREADY_EXISTS)
+            SAVED_TOKEN=$(cat "$OPERATOR_TOKEN_FILE" 2>/dev/null) || SAVED_TOKEN=""
+            # /health answers 401 to a missing or wrong token on every
+            # version that embeds the UI, so one request validates the copy
+            if [ -n "$SAVED_TOKEN" ] && curl -sf --max-time 5 -o /dev/null -H "Authorization: Bearer $SAVED_TOKEN" "http://localhost:${PORT}/health"; then
+                printf "└─ The server already has an operator token; the copy saved in %s works\n" "$OPERATOR_TOKEN_FILE"
+                TOKEN="$SAVED_TOKEN"
+                TOKEN_OK=true
+                TOKEN_SAVED=true
+            elif [ -n "$SAVED_TOKEN" ]; then
+                printf "└─ ${YELLOW}The server already has an operator token, and it does not accept the copy saved in %s${NC}\n" "$OPERATOR_TOKEN_FILE"
+            else
+                printf "└─ ${YELLOW}The server already has an operator token, but this script has no copy of it${NC}\n"
+            fi
+            ;;
+        "$MANUAL_TOKEN_MSG")
+            printf "└─ ${YELLOW}Could not create an operator token${NC}\n"
+            ;;
+        *)
+            TOKEN_OK=true
+            printf "${BOLD}════════════════════════════════════════════════════════════${NC}\n"
+            printf "${BOLD}OPERATOR TOKEN: Save this token. It will not be shown again.${NC}\n"
+            printf "%s\n" "$TOKEN"
+            printf "${BOLD}════════════════════════════════════════════════════════════${NC}\n"
+
+            # Persist after printing, so a failed write still leaves the user a copy
+            if write_private_file "$OPERATOR_TOKEN_FILE" "$TOKEN"; then
+                TOKEN_SAVED=true
+                printf "└─ Saved to %s\n" "$OPERATOR_TOKEN_FILE"
+            else
+                printf "└─ ${YELLOW}Warning: Could not save the token to %s. Keep the copy shown above.${NC}\n" "$OPERATOR_TOKEN_FILE"
+            fi
+            ;;
+    esac
+}
+
+# Smoke check for the embedded UI. The server loads the UI before its HTTP
+# listener starts and serves / without a token, so the UI answers as soon as
+# /health does; one request is enough. The result only selects the summary
+# wording and whether the browser opens. It never changes the exit status.
+# Sets: UI_READY
+check_embedded_ui() {
+    UI_READY=false
+    printf "\n${BOLD}Checking InfluxDB 3 Explorer${NC}\n"
+    if curl -sf --max-time 5 -o /dev/null "http://localhost:${PORT}/"; then
+        printf "└─ Explorer is served by InfluxDB on port %s\n" "$PORT"
+        UI_READY=true
+        open_browser_url "http://localhost:${PORT}"
+    else
+        printf "└─ ${YELLOW}Explorer did not respond at http://localhost:%s/${NC}\n" "$PORT"
     fi
 }
 
@@ -1694,6 +1860,18 @@ fi
 
 export INFLUXDB3_SERVE_INVOCATION_METHOD="install-script"
 
+# Enterprise 3.11.0+ serves the Explorer UI from the server. Every startup
+# choice, including Skip, loads or creates the session secret so that the
+# displayed serve command is real. Core and older Enterprise are unchanged.
+USE_EMBEDDED_UI=false
+UI_FLAGS=""
+UI_READY=false
+if has_embedded_ui; then
+    USE_EMBEDDED_UI=true
+    UI_FLAGS="--mode=all,webui"
+    load_webui_session_secret
+fi
+
 if [ "${EDITION}" = "Core" ]; then
     # Prompt user for startup options
     printf "\n"
@@ -1846,6 +2024,9 @@ else
         fi
         printf "├─${DIM} Storage: %s/data${NC}\n" "${INSTALL_LOC}"
         printf "├─${DIM} Plugins: %s/plugins${NC}\n" "${INSTALL_LOC}"
+        if [ "$USE_EMBEDDED_UI" = true ]; then
+            printf "├─${DIM} Explorer UI: embedded (session secret in %s)${NC}\n" "$WEBUI_SECRET_FILE"
+        fi
 
         # Create logs directory and generate timestamped log filename
         mkdir -p "$INSTALL_LOC/logs"
@@ -1864,13 +2045,14 @@ else
         # Show the command being executed
         display_enterprise_server_command true
 
-        # Start server in background with or without license flags
+        # Start server in background with or without license flags. The
+        # session secret, when the UI is on, is already exported.
         if [ -n "$LICENSE_TYPE" ] && [ -n "$LICENSE_EMAIL" ]; then
             # New license needed
-            "$INSTALL_LOC/$BINARY_NAME" serve --cluster-id="$CLUSTER_ID" --node-id="$NODE_ID" --license-type="$LICENSE_TYPE" --license-email="$LICENSE_EMAIL" --http-bind="0.0.0.0:$PORT" $STORAGE_FLAGS >> "$LOG_FILE" 2>&1 &
+            "$INSTALL_LOC/$BINARY_NAME" serve --cluster-id="$CLUSTER_ID" --node-id="$NODE_ID" --license-type="$LICENSE_TYPE" --license-email="$LICENSE_EMAIL" $UI_FLAGS --http-bind="0.0.0.0:$PORT" $STORAGE_FLAGS >> "$LOG_FILE" 2>&1 &
         else
             # Existing license file
-            "$INSTALL_LOC/$BINARY_NAME" serve --cluster-id="$CLUSTER_ID" --node-id="$NODE_ID" --http-bind="0.0.0.0:$PORT" $STORAGE_FLAGS >> "$LOG_FILE" 2>&1 &
+            "$INSTALL_LOC/$BINARY_NAME" serve --cluster-id="$CLUSTER_ID" --node-id="$NODE_ID" $UI_FLAGS --http-bind="0.0.0.0:$PORT" $STORAGE_FLAGS >> "$LOG_FILE" 2>&1 &
         fi
         PID="$!"
 
@@ -1949,6 +2131,9 @@ else
         printf "├─${DIM} License Type: %s${NC}\n" "$LICENSE_DESC"
         printf "├─${DIM} Email: %s${NC}\n" "$LICENSE_EMAIL"
         printf "├─${DIM} Storage: %s${NC}\n" "$STORAGE_TYPE"
+        if [ "$USE_EMBEDDED_UI" = true ]; then
+            printf "├─${DIM} Explorer UI: embedded (session secret in %s)${NC}\n" "$WEBUI_SECRET_FILE"
+        fi
 
         # Create logs directory and generate timestamped log filename
         mkdir -p "$INSTALL_LOC/logs"
@@ -1957,8 +2142,9 @@ else
 
         display_enterprise_server_command false
 
-        # Start server in background
-        "$INSTALL_LOC/$BINARY_NAME" serve --cluster-id="$CLUSTER_ID" --node-id="$NODE_ID" --license-type="$LICENSE_TYPE" --license-email="$LICENSE_EMAIL" --http-bind="0.0.0.0:$PORT" $STORAGE_FLAGS >> "$LOG_FILE" 2>&1 &
+        # Start server in background; the session secret, when the UI is on,
+        # is already exported
+        "$INSTALL_LOC/$BINARY_NAME" serve --cluster-id="$CLUSTER_ID" --node-id="$NODE_ID" --license-type="$LICENSE_TYPE" --license-email="$LICENSE_EMAIL" $UI_FLAGS --http-bind="0.0.0.0:$PORT" $STORAGE_FLAGS >> "$LOG_FILE" 2>&1 &
         PID="$!"
 
         printf "├─${DIM} Server started in background (PID: %s)${NC}\n" "$PID"
@@ -1969,6 +2155,13 @@ else
         printf "\n"
         printf "${BOLDGREEN}✓ InfluxDB 3 ${EDITION} is now installed. Nice!${NC}\n"
     fi
+
+    # With the UI on and the server up, create the token and check the UI.
+    # Neither runs after a failed startup or a skipped one.
+    if [ "$USE_EMBEDDED_UI" = true ] && [ "${SUCCESS:-0}" -eq 1 ]; then
+        create_binary_operator_token
+        check_embedded_ui
+    fi
 fi
 
 ### SUCCESS INFORMATION ###
@@ -1978,12 +2171,10 @@ if [ "${EDITION}" = "Enterprise" ] && [ "$SUCCESS" -eq 0 ] 2>/dev/null; then
     printf "├─ ${BOLD}${YELLOW}Check email verification:${NC} ${BOLD}Look for verification email and click the link${NC}\n"
     printf "├─ ${BOLD}   → This is the most common issue for Enterprise activation${NC}\n"
     printf "├─ ${BOLD}Manual startup:${NC} Try running the server manually to see detailed logs:\n"
-    printf "     influxdb3 serve \\\\\n"
-    printf "     --cluster-id=%s \\\\\n" "${CLUSTER_ID:-cluster0}"
-    printf "     --node-id=%s \\\\\n" "${NODE_ID:-node0}"
-    printf "     --license-type=%s \\\\\n" "${LICENSE_TYPE:-trial}"
-    printf "     --license-email=%s \\\\\n" "${LICENSE_EMAIL:-your@email.com}"
-    printf "     %s\n" "${STORAGE_FLAGS_ECHO:-"--object-store=file --data-dir $INSTALL_LOC/data --plugin-dir $INSTALL_LOC/plugins"}"
+    display_enterprise_manual_command
+    if [ "$USE_EMBEDDED_UI" = true ]; then
+        printf "├─ ${BOLD}Explorer UI:${NC} Once the server is running, open ${BLUE}http://localhost:%s${NC}, add a server with that URL, and paste an operator token\n" "$PORT"
+    fi
     printf "└─ ${BOLD}Common issues:${NC} Network connectivity, invalid email format, port conflicts\n"
 else
     printf "${BOLD}Next Steps${NC}\n"
@@ -1992,11 +2183,43 @@ else
     else
         printf "├─ Access InfluxDB with the ${BOLD}influxdb3${NC} command.\n"
     fi
-    printf "├─ Create admin token: ${BOLD}influxdb3 create token --admin${NC}\n"
+    if [ "$USE_EMBEDDED_UI" = true ] && [ "${SUCCESS:-0}" -eq 1 ]; then
+        # The UI runs inside the server, so the server URL to add in it is
+        # the same address the browser uses.
+        printf "├─ Open InfluxDB 3 Explorer at ${BLUE}http://localhost:%s${NC}\n" "$PORT"
+        if [ "$UI_READY" = false ]; then
+            printf "│  ${DIM}If the page does not load, check the log: %s${NC}\n" "$LOG_FILE"
+        fi
+        printf "│  1. Add a server with the URL ${BOLD}http://localhost:%s${NC}\n" "$PORT"
+        if [ "$TOKEN_SAVED" = true ]; then
+            printf "│  2. Paste your operator token ${DIM}(saved in %s)${NC}\n" "$OPERATOR_TOKEN_FILE"
+        elif [ "$TOKEN_OK" = true ]; then
+            printf "│  2. Paste your operator token ${DIM}(shown above; it could not be saved to %s)${NC}\n" "$OPERATOR_TOKEN_FILE"
+        elif [ "$TOKEN" = "TOKEN_ALREADY_EXISTS" ]; then
+            printf "│  2. Paste the operator token from your earlier install\n"
+            printf "│     ${DIM}This server already has one, and this script has no usable copy. To replace it, restart${NC}\n"
+            printf "│     ${DIM}the server with --admin-token-recovery-http-bind (default 127.0.0.1:8182), then run:${NC}\n"
+            printf "│     ${DIM}influxdb3 create token --admin --regenerate --host http://127.0.0.1:8182${NC}\n"
+        else
+            printf "│  2. Create an operator token, then paste it:\n"
+            printf "│     ${DIM}influxdb3 create token --admin --host http://localhost:%s${NC}\n" "$PORT"
+        fi
+    elif [ "$USE_EMBEDDED_UI" = true ]; then
+        # Installed without starting: show the command that enables the UI
+        printf "├─ Start InfluxDB with the embedded Explorer UI:\n"
+        display_enterprise_manual_command
+        printf "├─ Create admin token: ${BOLD}influxdb3 create token --admin${NC}\n"
+        printf "├─ Open InfluxDB 3 Explorer at ${BLUE}http://localhost:%s${NC}, add a server with that URL, and paste the token\n" "$PORT"
+    else
+        printf "├─ Create admin token: ${BOLD}influxdb3 create token --admin${NC}\n"
+    fi
     printf "└─ Begin writing data! Learn more at https://docs.influxdata.com/influxdb3/${EDITION_TAG}/get-started/write/\n\n"
 fi
 
-printf "┌────────────────────────────────────────────────────────────────────────────────────────┐\n"
-printf "│ Looking to use a UI for querying, plugins, management, and more?                       │\n"
-printf "│ Get InfluxDB 3 Explorer at ${BLUE}https://docs.influxdata.com/influxdb3/explorer/#quick-start${NC} │\n"
-printf "└────────────────────────────────────────────────────────────────────────────────────────┘\n\n"
+# Explorer is a separate install only where the server does not embed it
+if [ "$USE_EMBEDDED_UI" = false ]; then
+    printf "┌────────────────────────────────────────────────────────────────────────────────────────┐\n"
+    printf "│ Looking to use a UI for querying, plugins, management, and more?                       │\n"
+    printf "│ Get InfluxDB 3 Explorer at ${BLUE}https://docs.influxdata.com/influxdb3/explorer/#quick-start${NC} │\n"
+    printf "└────────────────────────────────────────────────────────────────────────────────────────┘\n\n"
+fi
