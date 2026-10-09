@@ -72,6 +72,9 @@
 # CONFIGURATION OPTIONS:
 #   Command Line Arguments:
 #     [enterprise]        Install Enterprise edition (default: Core)
+#     --version VERSION   Specify the InfluxDB3 version. Binary installs default to the
+#                         version set below; Docker installs default to the latest
+#                         3.x image and only pin when --version is given.
 #
 #   Interactive Prompts (Binary Installation):
 #     Installation Type:  Docker Compose or Binary
@@ -100,6 +103,7 @@
 #   Error Exits (exit 1):
 #     - Unsupported OS/Architecture (Intel Mac, Windows, etc.)
 #     - Docker not running or unavailable (Docker Compose path)
+#     - Requested version has no Docker image
 #     - Failed image pulls or docker compose commands
 #     - Failed binary download, signature verification, or extraction
 #     - Invalid SHA256 checksum on downloaded binary
@@ -180,7 +184,7 @@ INFLUXDB_VERSION="${INFLUXDB_OSS_VERSION}"
 print_usage() {
     printf "Usage: %s [enterprise] [--version VERSION]\n" "$0"
     printf "  enterprise: Install the Enterprise edition (optional)\n"
-    printf "  --version VERSION: Specify InfluxDB version (default: %s)\n" "$INFLUXDB_VERSION"
+    printf "  --version VERSION: Specify the InfluxDB version (binary default: %s; Docker default: latest)\n" "$INFLUXDB_VERSION"
 }
 
 NEWLINE='
@@ -267,6 +271,14 @@ fi
 
 URL="https://dl.influxdata.com/influxdb/releases/influxdb3-${EDITION_TAG}-${INFLUXDB_VERSION}_${ARTIFACT}.tar.gz"
 
+# Docker image. Specify the requested version only when --version was given;
+# otherwise use the floating major tag, which tracks the latest release.
+if [ "${INFLUXDB_VERSION_FLAG_SET}" = "1" ]; then
+    DOCKER_IMAGE="influxdb:${INFLUXDB_VERSION}-${EDITION_TAG}"
+else
+    DOCKER_IMAGE="influxdb:3-${EDITION_TAG}"
+fi
+
 
 
 # ==============================================================================
@@ -347,6 +359,49 @@ check_docker() {
     return 0
 }
 
+# --- Image Availability ---
+
+# True when registry or daemon output says the requested tag does not exist.
+# Shared by the pre-check and the pull error handler so the two never drift.
+# Covers `docker manifest inspect` ("no such manifest"), older daemons
+# ("manifest unknown"), and the containerd image store
+# ('failed to resolve reference "...": not found'). The last form is anchored
+# so unrelated "not found" errors, such as a missing credential helper, do not match.
+# Parameters: $1 - captured command output
+is_missing_image_error() {
+    echo "$1" | grep -qi "no such manifest\|manifest unknown\|failed to resolve reference .*: not found"
+}
+
+# Check that an image tag exists on the registry before any setup work.
+# `docker manifest inspect` queries the registry without downloading layers.
+# It runs on the CLI host and bypasses daemon mirrors and proxies, so only a
+# definitive "tag missing" answer is treated as fatal. Any other failure is a
+# warning and the later pull, which goes through the daemon, decides.
+# Uses the globals DOCKER_IMAGE, EDITION, and INFLUXDB_VERSION.
+# Returns: 1 if the registry reports the tag missing, 0 otherwise
+check_docker_image() {
+    printf "├─ Checking that %s is available..." "$DOCKER_IMAGE"
+
+    INSPECT_OUTPUT=$(docker manifest inspect "$DOCKER_IMAGE" 2>&1) && {
+        printf "SUCCESS\n"
+        return 0
+    }
+
+    if is_missing_image_error "$INSPECT_OUTPUT"; then
+        printf "${RED}FAILED${NC}\n"
+        printf "\n${RED}Error:${NC} InfluxDB 3 %s %s was not found on Docker Hub.\n" "$EDITION" "$INFLUXDB_VERSION" >&2
+        printf "No image tagged '%s'.\n" "$DOCKER_IMAGE" >&2
+        printf "Check the version passed with --version, or omit it to install the latest release.\n\n" >&2
+        return 1
+    fi
+
+    printf "${YELLOW}SKIPPED${NC}\n"
+    printf "│  ${YELLOW}Warning: Could not check '%s' on Docker Hub${NC}\n" "$DOCKER_IMAGE"
+    printf "│  %s\n" "$INSPECT_OUTPUT"
+    printf "│  Continuing; the image pull will report any problem\n"
+    return 0
+}
+
 # --- Image Management ---
 
 # Pull Docker Compose image with configurable error handling
@@ -380,7 +435,10 @@ pull_docker_image() {
 
             # Provide specific troubleshooting based on error content
             printf "${BOLD}Possible causes:${NC}\n"
-            if echo "$PULL_OUTPUT" | grep -qi "denied\|unauthorized"; then
+            if is_missing_image_error "$PULL_OUTPUT"; then
+                printf "  • The image tag does not exist on Docker Hub\n"
+                printf "  • Check the version passed with --version, or omit it to install the latest release\n"
+            elif echo "$PULL_OUTPUT" | grep -qi "denied\|unauthorized"; then
                 printf "  • Docker Hub authentication required or rate limited\n"
                 printf "  • Try: docker login\n"
             elif echo "$PULL_OUTPUT" | grep -qi "network\|timeout\|connection"; then
@@ -573,13 +631,11 @@ generate_docker_compose_yaml() {
     # Determine edition-specific values
     if [ "$EDITION_TYPE" = "enterprise" ]; then
         SERVICE_NAME="influxdb3-enterprise"
-        IMAGE_NAME="influxdb:3-enterprise"
         CLUSTER_ARG="      - --cluster-id=cluster0"
         ENV_SECTION="    environment:
       - INFLUXDB3_ENTERPRISE_LICENSE_EMAIL=\${INFLUXDB_EMAIL}"
     else
         SERVICE_NAME="influxdb3-core"
-        IMAGE_NAME="influxdb:3-core"
         CLUSTER_ARG=""
         ENV_SECTION=""
     fi
@@ -587,7 +643,7 @@ generate_docker_compose_yaml() {
     cat > "$DOCKER_DIR/docker-compose.yml" << COMPOSE_EOF
 services:
   ${SERVICE_NAME}:
-    image: ${IMAGE_NAME}
+    image: ${DOCKER_IMAGE}
     container_name: ${SERVICE_NAME}
     user: "${USER_UID}:${USER_GID}"
     ports:
@@ -727,6 +783,14 @@ setup_docker_compose() {
         return 1
     fi
 
+    # Fail fast on an unknown version before prompting or touching an existing stack.
+    # The floating 3-<edition> tag always exists, so only check a pinned version.
+    if [ "${INFLUXDB_VERSION_FLAG_SET}" = "1" ]; then
+        if ! check_docker_image; then
+            return 1
+        fi
+    fi
+
     # Enterprise-specific: Handle license prompting
     if [ "$EDITION_TYPE" = "enterprise" ]; then
         # Check for existing license in shared data directory
@@ -773,7 +837,7 @@ setup_docker_compose() {
     # Generate session secret
     SESSION_SECRET=$(generate_session_secret)
 
-    printf "├─ Creating docker-compose.yml\n"
+    printf "├─ Creating docker-compose.yml (%s)\n" "$DOCKER_IMAGE"
     generate_docker_compose_yaml "$EDITION_TYPE" "$SESSION_SECRET" "$LICENSE_EMAIL" "$DOCKER_DIR"
 
     cd "$DOCKER_DIR"
@@ -1259,14 +1323,16 @@ case "$INSTALL_TYPE" in
         # Set default installation directory
         DOCKER_DIR="$HOME/.influxdb/docker"
 
-        # Run appropriate setup based on edition
+        # Run appropriate setup based on edition. The call is unguarded so -e
+        # still applies inside the function; exit $? propagates a nonzero
+        # return when the script runs without -e.
         if [ "$EDITION" = "Enterprise" ]; then
             setup_docker_compose "enterprise" "$DOCKER_DIR"
         else
             setup_docker_compose "core" "$DOCKER_DIR"
         fi
 
-        exit 0
+        exit $?
         ;;
     2)
         # Binary installation selected - proceed directly with download
