@@ -31,7 +31,7 @@
 #   Docker Compose specific:
 #     ~/.influxdb/docker/
 #       ├── docker-compose.yml     (Docker service definitions)
-#       ├── .env                   (Environment variables)
+#       ├── .env                   (License email, session secret, operator token)
 #       └── explorer/
 #           ├── db/                (Explorer database)
 #           └── config/            (Explorer configuration)
@@ -60,7 +60,7 @@
 #   Docker Compose:
 #     - Detects existing docker-compose.yml at ~/.influxdb/docker/
 #     - Automatically upgrades in-place when detected
-#     - Extracts and reuses existing port configuration from .env
+#     - Reuses the Explorer session secret and operator token from .env
 #     - Pulls the selected version and restarts containers with health checks
 #     - Preserves all data in bind-mounted directories
 #
@@ -663,9 +663,7 @@ create_operator_token() {
 # Function to generate Docker Compose YAML
 generate_docker_compose_yaml() {
     EDITION_TYPE="$1"  # "core" or "enterprise"
-    SESSION_SECRET="$2"
-    LICENSE_EMAIL="$3"
-    DOCKER_DIR="$4"
+    DOCKER_DIR="$2"
 
     USER_UID=$(id -u)
     USER_GID=$(id -g)
@@ -727,21 +725,58 @@ networks:
   influxdb-network:
     driver: bridge
 COMPOSE_EOF
+}
 
-    # Create .env file
+# Function to write the Docker .env file
+# Parameters:
+#   $1 - edition: "core" or "enterprise"
+#   $2 - session secret
+#   $3 - license email (Enterprise only)
+#   $4 - operator token, or empty when none is known yet
+#   $5 - docker directory
+# Returns: 0 on success, 1 when the file cannot be written
+write_env_file() {
+    EDITION_TYPE="$1"
+    SESSION_SECRET="$2"
+    LICENSE_EMAIL="$3"
+    TOKEN="$4"
+    DOCKER_DIR="$5"
+
+    ENV_CONTENT="SESSION_SECRET=${SESSION_SECRET}"
     if [ "$EDITION_TYPE" = "enterprise" ]; then
-        cat > "$DOCKER_DIR/.env" << ENV_EOF
-INFLUXDB_EMAIL=${LICENSE_EMAIL}
-SESSION_SECRET=${SESSION_SECRET}
-ENV_EOF
-    else
-        cat > "$DOCKER_DIR/.env" << ENV_EOF
-SESSION_SECRET=${SESSION_SECRET}
-ENV_EOF
+        ENV_CONTENT="INFLUXDB_EMAIL=${LICENSE_EMAIL}
+${ENV_CONTENT}"
+    fi
+    if [ -n "$TOKEN" ]; then
+        ENV_CONTENT="${ENV_CONTENT}
+INFLUXDB_TOKEN=${TOKEN}"
     fi
 
-    # Set restrictive permissions on .env file
-    chmod 600 "$DOCKER_DIR/.env"
+    # umask protects a new file; chmod covers an existing one
+    (
+        umask 077
+        printf '%s\n' "$ENV_CONTENT" > "$DOCKER_DIR/.env"
+    ) && chmod 600 "$DOCKER_DIR/.env"
+}
+
+# Utility function to read one value from the Docker .env file
+# Parameters:
+#   $1 - env file path
+#   $2 - key
+# Returns: 1 when the file or key is missing
+read_env_value() {
+    ENV_FILE="$1"
+    KEY="$2"
+
+    if [ ! -f "$ENV_FILE" ]; then
+        return 1
+    fi
+    VALUE=$(grep "^${KEY}=" "$ENV_FILE" 2>/dev/null | tail -n1 | cut -d'=' -f2-)
+    if [ -z "$VALUE" ]; then
+        return 1
+    fi
+    echo "$VALUE"
+    return 0
 }
 
 # Function to configure Explorer via file
@@ -772,13 +807,14 @@ EOF
 }
 
 # Utility function to extract existing token from Explorer config
+# Fallback for installs made by older script versions
 extract_token_from_explorer_config() {
     DOCKER_DIR="$1"
     CONFIG_FILE="$DOCKER_DIR/explorer/config/config.json"
 
     if [ -f "$CONFIG_FILE" ]; then
         TOKEN=$(grep '"DEFAULT_API_TOKEN"' "$CONFIG_FILE" | cut -d'"' -f4)
-        if [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ]; then
+        if [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ] && [ "$TOKEN" != "YOUR_TOKEN_HERE" ]; then
             echo "$TOKEN"
             return 0
         fi
@@ -876,11 +912,26 @@ setup_docker_compose() {
     INFLUXDB_PORT=$(find_next_available_port "$INFLUXDB_PORT")
     EXPLORER_PORT=$(find_next_available_port "$EXPLORER_PORT")
 
-    # Generate session secret
-    SESSION_SECRET=$(generate_session_secret)
+    # Reuse the session secret and operator token from a previous run
+    SESSION_SECRET=$(read_env_value "$DOCKER_DIR/.env" "SESSION_SECRET") || SESSION_SECRET=""
+    if [ -z "$SESSION_SECRET" ]; then
+        SESSION_SECRET=$(generate_session_secret)
+    fi
+    TOKEN=$(read_env_value "$DOCKER_DIR/.env" "INFLUXDB_TOKEN") || TOKEN=""
+    if [ -z "$TOKEN" ]; then
+        TOKEN=$(extract_token_from_explorer_config "$DOCKER_DIR") || TOKEN=""
+    fi
+    # Keep the stored email when an existing license file skipped the prompt
+    if [ "$EDITION_TYPE" = "enterprise" ] && [ -z "$LICENSE_EMAIL" ]; then
+        LICENSE_EMAIL=$(read_env_value "$DOCKER_DIR/.env" "INFLUXDB_EMAIL") || LICENSE_EMAIL=""
+    fi
 
     printf "├─ Creating docker-compose.yml (%s)\n" "$DOCKER_IMAGE"
-    generate_docker_compose_yaml "$EDITION_TYPE" "$SESSION_SECRET" "$LICENSE_EMAIL" "$DOCKER_DIR"
+    generate_docker_compose_yaml "$EDITION_TYPE" "$DOCKER_DIR"
+    if ! write_env_file "$EDITION_TYPE" "$SESSION_SECRET" "$LICENSE_EMAIL" "$TOKEN" "$DOCKER_DIR"; then
+        printf "└─ ${RED}Error: Could not write %s${NC}\n\n" "$DOCKER_DIR/.env"
+        return 1
+    fi
 
     cd "$DOCKER_DIR"
 
@@ -896,24 +947,12 @@ setup_docker_compose() {
         return 1
     fi
 
-    # Check for existing token in Explorer config, or create new one
-    CONFIG_FILE="$DOCKER_DIR/explorer/config/config.json"
+    # Reuse the token read above, or create a new one
     TOKEN_IS_NEW=false
     EXPLORER_DEPLOYED=false
 
-    if [ -f "$CONFIG_FILE" ]; then
-        printf "└─ Found existing Explorer config\n\n"
-        TOKEN=$(extract_token_from_explorer_config "$DOCKER_DIR")
-
-        if [ -n "$TOKEN" ]; then
-            TOKEN_IS_NEW=false
-        else
-            printf "   ${YELLOW}Config exists but no valid token found${NC}\n"
-            printf "   Creating new operator token\n"
-            TOKEN=$(create_operator_token "$CONTAINER_NAME")
-            TOKEN_IS_NEW=true
-            printf "\n"
-        fi
+    if [ -n "$TOKEN" ]; then
+        printf "└─ Found existing operator token\n\n"
     else
         printf "└─ Creating operator token\n"
         TOKEN=$(create_operator_token "$CONTAINER_NAME")
@@ -928,6 +967,12 @@ setup_docker_compose() {
             printf "${BOLD}OPERATOR TOKEN: Save this token. It will not be shown again.${NC}\n"
             printf "%s\n" "$TOKEN"
             printf "${BOLD}════════════════════════════════════════════════════════════${NC}\n\n"
+
+            # Persist after printing, so a failed write still leaves the user a copy
+            if ! write_env_file "$EDITION_TYPE" "$SESSION_SECRET" "$LICENSE_EMAIL" "$TOKEN" "$DOCKER_DIR"; then
+                printf "${YELLOW}Warning: Could not save the token to %s${NC}\n" "$DOCKER_DIR/.env"
+                printf "${YELLOW}Keep the copy shown above. The next run may not be able to reuse it.${NC}\n\n"
+            fi
         fi
 
         # Now launch Explorer after showing the token
