@@ -191,9 +191,8 @@ NEWLINE='
 is_valid_version() {
     case "$1" in
         *"${NEWLINE}"*) return 1 ;;
-        1.*|2.*) return 1 ;;  # Only InfluxDB3 supported
     esac
-    printf '%s' "$1" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'
+    printf '%s' "$1" | grep -Eq '^3\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
 }
 
 while [ $# -gt 0 ]; do
