@@ -13,6 +13,9 @@
 #   1. Docker Compose: Complete stack (InfluxDB + Explorer UI)
 #      - Pins InfluxDB to the version set in this script, or to --version
 #      - Auto-creates docker-compose.yml with proper networking
+#      - Enterprise 3.11.0+ serves the embedded Explorer UI from the InfluxDB
+#        container (--mode=all,webui); Core and older Enterprise run the
+#        separate Explorer container
 #      - Manages Explorer configuration and session secrets
 #      - Supports upgrades of existing Docker installations
 #
@@ -32,9 +35,9 @@
 #     ~/.influxdb/docker/
 #       ├── docker-compose.yml     (Docker service definitions)
 #       ├── .env                   (License email, session secret, operator token)
-#       └── explorer/
-#           ├── db/                (Explorer database)
-#           └── config/            (Explorer configuration)
+#       └── explorer/              (Explorer container only; not created for
+#           ├── db/                 Enterprise 3.11.0+, and left in place on
+#           └── config/             upgrade)
 #
 #   Binary specific:
 #     ~/.influxdb/
@@ -87,8 +90,10 @@
 #   Docker Compose Specific:
 #     Port Selection:     Automatic via find_next_available_port()
 #     Session Secret:     64 hex characters from /dev/urandom
-#     InfluxDB Port:      Default 8181 (mapped to container 8181)
-#     Explorer Port:      Default 8888 (mapped to container 8080)
+#     InfluxDB Port:      Default 8181 (mapped to container 8181); the embedded
+#                         Explorer UI is served on this port
+#     Explorer Port:      Default 8888 (mapped to container 8080); Explorer
+#                         container only
 #     Container Restart:  unless-stopped policy
 #
 # EXIT POINTS AND CONDITIONS:
@@ -119,13 +124,19 @@
 #
 #   Docker Compose:
 #     - Creates internal network (influxdb-network) for service communication
-#     - Configures Explorer to communicate via container name internally
+#     - Configures the Explorer container to reach InfluxDB by container name
+#     - Embedded UI (Enterprise 3.11.0+): passes --mode=all,webui and the
+#       session secret through INFLUXDB3_WEBUI_SESSION_SECRET; the UI runs
+#       inside the server, so the server URL to add in it is always
+#       http://localhost:8181 whatever host port is published
 #     - Opens Explorer UI in default browser upon successful startup
 #     - Filters verbose docker compose output for cleaner display
 #
 #   Health Checking:
 #     - InfluxDB (Docker): Waits for "startup time:" in container logs
-#     - Explorer: Polls /api/health endpoint for "ok/status/healthy"
+#     - Explorer container: Polls /api/health endpoint for "ok/status/healthy"
+#     - Embedded UI: One request on / after the InfluxDB check; the result only
+#       selects the summary wording and whether the browser opens
 #
 # SHELL EXECUTION CONTEXT:
 #   - Runs with `sh -e` (error exit on command failure)
@@ -562,14 +573,27 @@ filter_docker_output() {
 # --- Filesystem Setup ---
 
 # Utility function to create docker directories with permissions
+# Parameters:
+#   $1 - docker directory
+#   $2 - "true" when the server embeds the Explorer UI, so no Explorer
+#        container runs and its directories are not needed. An existing
+#        explorer/ directory from an older install is left in place.
 create_docker_directories() {
     DOCKER_DIR="$1"
+    EMBEDDED_UI="${2:-false}"
 
     # Create shared data directories (used by both Docker and binary)
     mkdir -p "$HOME/.influxdb/data"
     mkdir -p "$HOME/.influxdb/plugins"
 
-    # Create Docker-specific directories
+    # Compose file and .env live here
+    mkdir -p "$DOCKER_DIR"
+
+    if [ "$EMBEDDED_UI" = "true" ]; then
+        return 0
+    fi
+
+    # Explorer container directories
     mkdir -p "$DOCKER_DIR/explorer/db"
     mkdir -p "$DOCKER_DIR/explorer/config"
 
@@ -698,9 +722,16 @@ create_operator_token() {
 # --- Configuration Generation ---
 
 # Function to generate Docker Compose YAML
+# Parameters:
+#   $1 - edition: "core" or "enterprise"
+#   $2 - docker directory
+#   $3 - "true" when the server embeds the Explorer UI (Enterprise 3.11.0+).
+#        The server then runs with --mode=all,webui and the session secret in
+#        its environment, and the compose file has no Explorer service.
 generate_docker_compose_yaml() {
-    EDITION_TYPE="$1"  # "core" or "enterprise"
+    EDITION_TYPE="$1"
     DOCKER_DIR="$2"
+    EMBEDDED_UI="${3:-false}"
 
     USER_UID=$(id -u)
     USER_GID=$(id -g)
@@ -708,13 +739,49 @@ generate_docker_compose_yaml() {
     # Determine edition-specific values
     if [ "$EDITION_TYPE" = "enterprise" ]; then
         SERVICE_NAME="influxdb3-enterprise"
-        CLUSTER_ARG="      - --cluster-id=cluster0"
+        EXTRA_ARGS="      - --cluster-id=cluster0"
         ENV_SECTION="    environment:
       - INFLUXDB3_ENTERPRISE_LICENSE_EMAIL=\${INFLUXDB_EMAIL}"
     else
         SERVICE_NAME="influxdb3-core"
-        CLUSTER_ARG=""
+        EXTRA_ARGS=""
         ENV_SECTION=""
+    fi
+
+    if [ "$EMBEDDED_UI" = "true" ]; then
+        # `all` does not include `webui`, so both are listed. The secret is
+        # required whenever webui is on; it is passed through the environment
+        # so it does not appear in the container's command line.
+        if [ -n "$EXTRA_ARGS" ]; then
+            EXTRA_ARGS="${EXTRA_ARGS}
+"
+        fi
+        EXTRA_ARGS="${EXTRA_ARGS}      - --mode=all,webui"
+        if [ -z "$ENV_SECTION" ]; then
+            ENV_SECTION="    environment:"
+        fi
+        ENV_SECTION="${ENV_SECTION}
+      - INFLUXDB3_WEBUI_SESSION_SECRET=\${SESSION_SECRET}"
+        EXPLORER_SERVICE=""
+    else
+        EXPLORER_SERVICE="
+  influxdb3-explorer:
+    image: ${EXPLORER_IMAGE}
+    container_name: influxdb3-explorer
+    command: [\"--mode=admin\"]
+    ports:
+      - \"${EXPLORER_PORT}:8080\"
+    volumes:
+      - ./explorer/db:/db:rw
+      - ./explorer/config:/app-root/config:ro
+    environment:
+      - SESSION_SECRET_KEY=\${SESSION_SECRET}
+    restart: unless-stopped
+    depends_on:
+      - ${SERVICE_NAME}
+    networks:
+      - influxdb-network
+"
     fi
 
     cat > "$DOCKER_DIR/docker-compose.yml" << COMPOSE_EOF
@@ -728,8 +795,8 @@ services:
     command:
       - influxdb3
       - serve
-      - --node-id=node0${CLUSTER_ARG:+
-${CLUSTER_ARG}}
+      - --node-id=node0${EXTRA_ARGS:+
+${EXTRA_ARGS}}
       - --object-store=file
       - --data-dir=/var/lib/influxdb3/data
       - --plugin-dir=/var/lib/influxdb3/plugins${ENV_SECTION:+
@@ -740,24 +807,7 @@ ${ENV_SECTION}}
     restart: unless-stopped
     networks:
       - influxdb-network
-
-  influxdb3-explorer:
-    image: ${EXPLORER_IMAGE}
-    container_name: influxdb3-explorer
-    command: ["--mode=admin"]
-    ports:
-      - "${EXPLORER_PORT}:8080"
-    volumes:
-      - ./explorer/db:/db:rw
-      - ./explorer/config:/app-root/config:ro
-    environment:
-      - SESSION_SECRET_KEY=\${SESSION_SECRET}
-    restart: unless-stopped
-    depends_on:
-      - ${SERVICE_NAME}
-    networks:
-      - influxdb-network
-
+${EXPLORER_SERVICE}
 networks:
   influxdb-network:
     driver: bridge
@@ -883,6 +933,16 @@ setup_docker_compose() {
         SERVER_NAME="InfluxDB 3 Core"
     fi
 
+    # Enterprise 3.11.0+ serves the Explorer UI from the server itself, so no
+    # Explorer container runs. Core, and Enterprise below 3.11.0, keep the
+    # Explorer container. The image is pinned to INFLUXDB_VERSION, so the
+    # check matches the version that runs.
+    if has_embedded_ui; then
+        USE_EMBEDDED_UI=true
+    else
+        USE_EMBEDDED_UI=false
+    fi
+
     printf "\n${BOLD}Setting up InfluxDB 3 ${EDITION_NAME}${NC}\n"
 
     # Verify Docker is running before doing any setup work (silent check)
@@ -932,7 +992,7 @@ setup_docker_compose() {
     fi
 
     printf "├─ Creating directories\n"
-    create_docker_directories "$DOCKER_DIR"
+    create_docker_directories "$DOCKER_DIR" "$USE_EMBEDDED_UI"
 
     # Stop any existing containers before reconfiguring
     if [ -f "$DOCKER_DIR/docker-compose.yml" ]; then
@@ -945,9 +1005,11 @@ setup_docker_compose() {
         cd - > /dev/null
     fi
 
-    # Check for available ports
+    # Check for available ports. The embedded UI shares the InfluxDB port.
     INFLUXDB_PORT=$(find_next_available_port "$INFLUXDB_PORT")
-    EXPLORER_PORT=$(find_next_available_port "$EXPLORER_PORT")
+    if [ "$USE_EMBEDDED_UI" = false ]; then
+        EXPLORER_PORT=$(find_next_available_port "$EXPLORER_PORT")
+    fi
 
     # Reuse the session secret (unless malformed) and operator token from a previous run
     SESSION_SECRET=$(read_env_value "$DOCKER_DIR/.env" "SESSION_SECRET") || SESSION_SECRET=""
@@ -970,7 +1032,7 @@ setup_docker_compose() {
     fi
 
     printf "├─ Creating docker-compose.yml (%s)\n" "$DOCKER_IMAGE"
-    generate_docker_compose_yaml "$EDITION_TYPE" "$DOCKER_DIR"
+    generate_docker_compose_yaml "$EDITION_TYPE" "$DOCKER_DIR" "$USE_EMBEDDED_UI"
     if ! write_env_file "$EDITION_TYPE" "$SESSION_SECRET" "$LICENSE_EMAIL" "$TOKEN" "$DOCKER_DIR"; then
         printf "└─ ${RED}Error: Could not write %s${NC}\n\n" "$DOCKER_DIR/.env"
         return 1
@@ -992,7 +1054,10 @@ setup_docker_compose() {
 
     # Reuse the token read above, or create a new one
     TOKEN_IS_NEW=false
-    EXPLORER_DEPLOYED=false
+    TOKEN_OK=false           # a usable token is known, new or reused
+    TOKEN_SAVED=false        # that token is in .env; a reused token already is
+    EXPLORER_DEPLOYED=false  # Explorer container answered its health check
+    UI_READY=false           # embedded Explorer UI answered the smoke check
 
     if [ -n "$TOKEN" ]; then
         printf "└─ Found existing operator token\n\n"
@@ -1005,6 +1070,7 @@ setup_docker_compose() {
 
     # Display token BEFORE launching Explorer (only if newly created)
     if [ "$TOKEN" != "$MANUAL_TOKEN_MSG" ] && [ "$TOKEN" != "TOKEN_ALREADY_EXISTS" ]; then
+        TOKEN_OK=true
         if [ "$TOKEN_IS_NEW" = true ]; then
             printf "${BOLD}════════════════════════════════════════════════════════════${NC}\n"
             printf "${BOLD}OPERATOR TOKEN: Save this token. It will not be shown again.${NC}\n"
@@ -1012,12 +1078,35 @@ setup_docker_compose() {
             printf "${BOLD}════════════════════════════════════════════════════════════${NC}\n\n"
 
             # Persist after printing, so a failed write still leaves the user a copy
-            if ! write_env_file "$EDITION_TYPE" "$SESSION_SECRET" "$LICENSE_EMAIL" "$TOKEN" "$DOCKER_DIR"; then
+            if write_env_file "$EDITION_TYPE" "$SESSION_SECRET" "$LICENSE_EMAIL" "$TOKEN" "$DOCKER_DIR"; then
+                TOKEN_SAVED=true
+            else
                 printf "${YELLOW}Warning: Could not save the token to %s${NC}\n" "$DOCKER_DIR/.env"
                 printf "${YELLOW}Keep the copy shown above. The next run may not be able to reuse it.${NC}\n\n"
             fi
+        else
+            # A reused token was written to .env by the earlier write, which
+            # is fatal when it fails, so reaching here means it is on disk.
+            TOKEN_SAVED=true
         fi
+    fi
 
+    if [ "$USE_EMBEDDED_UI" = true ]; then
+        # Smoke check. The server loads the UI before its HTTP listener starts
+        # and serves / without a token, so the UI answers as soon as the
+        # readiness check above does; one request is enough. The result only
+        # selects the summary wording and whether the browser opens. It never
+        # changes the exit status. The token is not needed here, so a failed
+        # token creation still leaves a running UI.
+        printf "${BOLD}Checking InfluxDB 3 Explorer...${NC}\n"
+        if curl -sf --max-time 5 -o /dev/null "http://localhost:${INFLUXDB_PORT}/"; then
+            printf "└─ Explorer is served by InfluxDB on port %s\n" "$INFLUXDB_PORT"
+            UI_READY=true
+            open_browser_url "http://localhost:${INFLUXDB_PORT}"
+        else
+            printf "└─ ${YELLOW}Explorer did not respond at http://localhost:%s/${NC}\n" "$INFLUXDB_PORT"
+        fi
+    elif [ "$TOKEN_OK" = true ]; then
         # Now launch Explorer after showing the token
         printf "${BOLD}Setting up InfluxDB 3 Explorer...${NC}\n"
 
@@ -1047,6 +1136,48 @@ setup_docker_compose() {
     fi
 
     # Display success message and access points AFTER Explorer launch
+    if [ "$USE_EMBEDDED_UI" = true ]; then
+        if [ "$UI_READY" = true ]; then
+            printf "\n${BOLDGREEN}✓ InfluxDB 3 ${EDITION_NAME} with InfluxDB 3 Explorer successfully deployed${NC}\n\n"
+        else
+            printf "\n${BOLDGREEN}✓ InfluxDB 3 ${EDITION_NAME} successfully deployed${NC}\n\n"
+        fi
+        printf "${BOLD}Access Points:${NC}\n"
+        printf "├─ Explorer UI:  ${BLUE}http://localhost:${INFLUXDB_PORT}${NC}\n"
+        printf "└─ InfluxDB API: ${BLUE}http://localhost:${INFLUXDB_PORT}${NC}\n\n"
+
+        printf "${BOLD}Storage Locations:${NC}\n"
+        printf "├─ InfluxDB Data:    ${DIM}%s/.influxdb/data${NC}\n" "$HOME"
+        printf "└─ InfluxDB Plugins: ${DIM}%s/.influxdb/plugins${NC}\n\n" "$HOME"
+
+        printf "${BOLD}Configuration Files:${NC}\n"
+        printf "└─ Docker Compose:   ${DIM}%s/docker-compose.yml${NC}\n\n" "$DOCKER_DIR"
+
+        # The UI runs inside the server process, so a server URL entered in
+        # the UI is resolved from inside the container, where the server
+        # always listens on 8181 whatever port Docker publishes on the host.
+        printf "${BOLD}To Connect InfluxDB 3 Explorer to Your Server:${NC}\n"
+        printf "1. Open ${BLUE}http://localhost:${INFLUXDB_PORT}${NC} in your browser\n"
+        if [ "$UI_READY" = false ]; then
+            printf "   ${DIM}If the page does not load, check: docker logs %s${NC}\n" "$CONTAINER_NAME"
+        fi
+        printf "2. Add a server with the URL ${BOLD}http://localhost:8181${NC}\n"
+        printf "   ${DIM}This is the server's address inside the container, whatever port is published on this host${NC}\n"
+        if [ "$TOKEN_SAVED" = true ]; then
+            printf "3. Paste your operator token ${DIM}(saved in %s/.env)${NC}\n\n" "$DOCKER_DIR"
+        elif [ "$TOKEN_OK" = true ]; then
+            printf "3. Paste your operator token ${DIM}(shown above; it could not be saved to %s/.env)${NC}\n\n" "$DOCKER_DIR"
+        elif [ "$TOKEN" = "TOKEN_ALREADY_EXISTS" ]; then
+            printf "3. Paste your operator token\n"
+            printf "   ${DIM}One already exists for this data directory, but this script has no copy of it${NC}\n\n"
+        else
+            printf "3. Create an operator token, then paste it:\n"
+            printf "   ${DIM}docker exec %s influxdb3 create token --admin${NC}\n\n" "$CONTAINER_NAME"
+        fi
+
+        return 0
+    fi
+
     if [ "$EXPLORER_DEPLOYED" = true ]; then
         printf "\n${BOLDGREEN}✓ InfluxDB 3 ${EDITION_NAME} with InfluxDB 3 Explorer successfully deployed${NC}\n\n"
     else
