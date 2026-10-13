@@ -135,6 +135,7 @@
 #   Binary Embedded UI (Enterprise 3.11.0+):
 #     - Every startup choice, including Skip, loads or creates the session
 #       secret file so the displayed serve command is real
+#     - A malformed secret file is replaced; a failed generation stops the script
 #     - The secret reaches the server through INFLUXDB3_WEBUI_SESSION_SECRET,
 #       not a flag, so it is absent from the process list; displayed commands
 #       show it as "$(cat ~/.influxdb/webui-session-secret)"
@@ -1621,14 +1622,21 @@ write_private_file() {
 # The server requires a secret whenever webui is on. It is passed through the
 # environment, not a flag, so it does not appear in the process list, and it
 # is reused on every run so that a re-run does not sign browsers out.
-# Exits: 1 when the file cannot be written
+# Exits: 1 when the secret cannot be generated or the file cannot be written
 load_webui_session_secret() {
     WEBUI_SESSION_SECRET=""
     if [ -f "$WEBUI_SECRET_FILE" ]; then
         WEBUI_SESSION_SECRET=$(cat "$WEBUI_SECRET_FILE" 2>/dev/null) || WEBUI_SESSION_SECRET=""
     fi
-    if [ -z "$WEBUI_SESSION_SECRET" ]; then
-        WEBUI_SESSION_SECRET=$(generate_session_secret)
+    # A malformed file (failed write, hand edit) is replaced
+    if ! is_session_secret "$WEBUI_SESSION_SECRET"; then
+        if [ -n "$WEBUI_SESSION_SECRET" ]; then
+            printf "\n${YELLOW}Warning: '%s' does not hold a usable session secret; generating a new one. Browsers signed in to Explorer will need to sign in again.${NC}\n" "$WEBUI_SECRET_FILE" >&2
+        fi
+        if ! WEBUI_SESSION_SECRET=$(generate_session_secret); then
+            printf "\n${RED}Error:${NC} Could not generate the Explorer session secret from /dev/urandom.\n" >&2
+            exit 1
+        fi
         if ! write_private_file "$WEBUI_SECRET_FILE" "$WEBUI_SESSION_SECRET"; then
             printf "\n${RED}Error:${NC} Could not write the Explorer session secret to '%s'.\n" "$WEBUI_SECRET_FILE" >&2
             exit 1
@@ -2198,6 +2206,7 @@ else
             printf "│     ${DIM}This server already has one, and this script has no usable copy. To replace it, restart${NC}\n"
             printf "│     ${DIM}the server with --admin-token-recovery-http-bind (default 127.0.0.1:8182), then run:${NC}\n"
             printf "│     ${DIM}influxdb3 create token --admin --regenerate --host http://127.0.0.1:8182${NC}\n"
+            printf "│     ${DIM}Save the new token in %s so the next run can reuse it${NC}\n" "$OPERATOR_TOKEN_FILE"
         else
             printf "│  2. Create an operator token, then paste it:\n"
             printf "│     ${DIM}influxdb3 create token --admin --host http://localhost:%s${NC}\n" "$PORT"
