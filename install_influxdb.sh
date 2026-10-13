@@ -142,6 +142,8 @@
 #     - The operator token is created after the health check, printed once,
 #       then saved; the UI runs inside the server, so the server URL to add
 #       in it is the same http://localhost:<port> the browser uses
+#     - Operator token: created on every run; on 409 or a failed request the
+#       saved copy is reused only if /health accepts it
 #
 #   Docker Compose:
 #     - Creates internal network (influxdb-network) for service communication
@@ -150,8 +152,9 @@
 #       session secret through INFLUXDB3_WEBUI_SESSION_SECRET; the UI runs
 #       inside the server, so the server URL to add in it is always
 #       http://localhost:8181 whatever host port is published
-#     - Operator token: creation is attempted on every run; on 409 the .env
-#       copy is checked against /health (embedded UI) or trusted (Explorer)
+#     - Operator token: creation is attempted on every run; on 409 or a failed
+#       request the .env copy is checked against /health (embedded UI) or
+#       trusted (Explorer)
 #     - Opens Explorer UI in default browser upon successful startup
 #     - Filters verbose docker compose output for cleaner display
 #
@@ -194,7 +197,6 @@ readonly NC='\033[0m' # No Color
 INFLUXDB_PORT=8181  # Can be changed if port is in use
 EXPLORER_PORT=8888  # Can be changed if port is in use
 readonly EXPLORER_IMAGE="influxdata/influxdb3-ui"
-readonly MANUAL_TOKEN_MSG="MANUAL_TOKEN_CREATION_REQUIRED"
 
 ARCHITECTURE=$(uname -m)
 ARTIFACT=""
@@ -704,13 +706,12 @@ wait_for_explorer_ready() {
 
 # --- Token Management ---
 
-# Utility function to create operator token via API
+# Create an operator token via the API; prints it on success only
 # Parameters:
-#   $1 - container name (Docker path; empty on the binary path)
-#   $2 - port to call; defaults to the Docker host port
+#   $1 - port to call
+# Exits: 0 on success, 2 on HTTP 409, 1 otherwise
 create_operator_token() {
-    CONTAINER_NAME="$1"
-    TOKEN_PORT="${2:-$INFLUXDB_PORT}"
+    TOKEN_PORT="$1"
 
     # Try API with retries
     MAX_RETRIES=3
@@ -727,7 +728,6 @@ create_operator_token() {
 
         # Check for 409 conflict
         if [ "$HTTP_CODE" = "409" ]; then
-            echo "TOKEN_ALREADY_EXISTS"
             return 2
         fi
 
@@ -742,14 +742,56 @@ create_operator_token() {
         fi
     done
 
-    # Return token or manual creation message
     if [ -n "$TOKEN" ]; then
         echo "$TOKEN"
         return 0
-    else
-        echo "$MANUAL_TOKEN_MSG"
-        return 1
     fi
+    return 1
+}
+
+# Exits 0 when /health on port $1 accepts token $2
+check_operator_token() {
+    # curl 7.55 or newer reads the header from stdin
+    printf 'Authorization: Bearer %s\n' "$2" | curl -sf --max-time 5 -o /dev/null -H @- "http://localhost:$1/health"
+}
+
+# Create a token, or fall back to the saved one. Prints nothing. Uses $1-$3
+# in place so the callers' PORT and SAVED_TOKEN survive.
+# Parameters:
+#   $1 - port to call
+#   $2 - saved token, or empty
+#   $3 - "true" to reuse the saved token only if /health accepts it
+# Sets: TOKEN, TOKEN_OK, TOKEN_IS_NEW, TOKEN_EXISTS (409: server has one)
+resolve_operator_token() {
+    TOKEN_OK=false
+    TOKEN_IS_NEW=false
+    TOKEN_EXISTS=false
+
+    CREATE_STATUS=0
+    TOKEN=$(create_operator_token "$1") || CREATE_STATUS=$?
+    if [ "$CREATE_STATUS" -eq 0 ]; then
+        TOKEN_OK=true
+        TOKEN_IS_NEW=true
+        return 0
+    fi
+
+    TOKEN=""
+    if [ "$CREATE_STATUS" -eq 2 ]; then
+        TOKEN_EXISTS=true
+    fi
+    if [ -n "$2" ] && { [ "$3" != true ] || check_operator_token "$1" "$2"; }; then
+        TOKEN="$2"
+        TOKEN_OK=true
+    fi
+    return 0
+}
+
+# Print the token banner for $1
+print_operator_token_banner() {
+    printf "${BOLD}════════════════════════════════════════════════════════════${NC}\n"
+    printf "${BOLD}OPERATOR TOKEN: Save this token. It will not be shown again.${NC}\n"
+    printf "%s\n" "$1"
+    printf "${BOLD}════════════════════════════════════════════════════════════${NC}\n"
 }
 
 # --- Configuration Generation ---
@@ -1086,50 +1128,35 @@ setup_docker_compose() {
         return 1
     fi
 
-    # Try to create a token first; a 409 means one exists, and the saved
-    # copy counts only if the server accepts it (checked via /health where
-    # the UI is embedded, trusted elsewhere)
-    TOKEN_IS_NEW=false
-    TOKEN_OK=false           # a usable token is known, new or reused
+    # Create a token, or fall back to the copy saved in .env
     TOKEN_SAVED=false        # that token is in .env; a reused token already is
     EXPLORER_DEPLOYED=false  # Explorer container answered its health check
     UI_READY=false           # embedded Explorer UI answered the smoke check
     SAVED_TOKEN="$TOKEN"
 
     printf "└─ Creating operator token\n"
-    TOKEN=$(create_operator_token "$CONTAINER_NAME") || true
-    case "$TOKEN" in
-        TOKEN_ALREADY_EXISTS|"$MANUAL_TOKEN_MSG")
-            if [ -z "$SAVED_TOKEN" ]; then
-                if [ "$TOKEN" = "TOKEN_ALREADY_EXISTS" ]; then
-                    printf "   ${YELLOW}The server already has an operator token, but this script has no copy of it${NC}\n"
-                else
-                    printf "   ${YELLOW}Could not create an operator token${NC}\n"
-                fi
-            elif [ "$USE_EMBEDDED_UI" = false ] || curl -sf --max-time 5 -o /dev/null -H "Authorization: Bearer $SAVED_TOKEN" "http://localhost:${INFLUXDB_PORT}/health"; then
-                printf "   Found existing operator token\n"
-                TOKEN="$SAVED_TOKEN"
-                TOKEN_OK=true
-                TOKEN_SAVED=true  # already in .env from the earlier write
-            elif [ "$TOKEN" = "TOKEN_ALREADY_EXISTS" ]; then
-                printf "   ${YELLOW}The server already has an operator token, and it does not accept the copy saved in %s/.env${NC}\n" "$DOCKER_DIR"
-            else
-                printf "   ${YELLOW}Could not create an operator token, and the server did not accept the copy saved in %s/.env${NC}\n" "$DOCKER_DIR"
-            fi
-            ;;
-        *)
-            TOKEN_IS_NEW=true
-            TOKEN_OK=true
-            ;;
-    esac
+    # Verify only with the embedded UI; the Explorer path keeps trusting the saved copy, as before
+    resolve_operator_token "$INFLUXDB_PORT" "$SAVED_TOKEN" "$USE_EMBEDDED_UI"
+    if [ "$TOKEN_OK" = false ]; then
+        if [ -z "$SAVED_TOKEN" ] && [ "$TOKEN_EXISTS" = true ]; then
+            printf "   ${YELLOW}The server already has an operator token, but this script has no copy of it${NC}\n"
+        elif [ -z "$SAVED_TOKEN" ]; then
+            printf "   ${YELLOW}Could not create an operator token${NC}\n"
+        elif [ "$TOKEN_EXISTS" = true ]; then
+            printf "   ${YELLOW}The server already has an operator token, and it does not accept the copy saved in %s/.env${NC}\n" "$DOCKER_DIR"
+        else
+            printf "   ${YELLOW}Could not create an operator token, and the server did not accept the copy saved in %s/.env${NC}\n" "$DOCKER_DIR"
+        fi
+    elif [ "$TOKEN_IS_NEW" = false ]; then
+        printf "   Found existing operator token\n"
+        TOKEN_SAVED=true  # already in .env from the earlier write
+    fi
     printf "\n"
 
     # Display a new token BEFORE launching Explorer
     if [ "$TOKEN_IS_NEW" = true ]; then
-        printf "${BOLD}════════════════════════════════════════════════════════════${NC}\n"
-        printf "${BOLD}OPERATOR TOKEN: Save this token. It will not be shown again.${NC}\n"
-        printf "%s\n" "$TOKEN"
-        printf "${BOLD}════════════════════════════════════════════════════════════${NC}\n\n"
+        print_operator_token_banner "$TOKEN"
+        printf "\n"
 
         # Persist after printing, so a failed write still leaves the user a copy
         if write_env_file "$EDITION_TYPE" "$SESSION_SECRET" "$LICENSE_EMAIL" "$TOKEN" "$DOCKER_DIR"; then
@@ -1216,7 +1243,7 @@ setup_docker_compose() {
             printf "3. Paste your operator token ${DIM}(saved in %s/.env)${NC}\n\n" "$DOCKER_DIR"
         elif [ "$TOKEN_OK" = true ]; then
             printf "3. Paste your operator token ${DIM}(shown above; it could not be saved to %s/.env)${NC}\n\n" "$DOCKER_DIR"
-        elif [ "$TOKEN" = "TOKEN_ALREADY_EXISTS" ]; then
+        elif [ "$TOKEN_EXISTS" = true ]; then
             printf "3. Paste the operator token from your earlier install\n"
             printf "   ${DIM}This server already has one, and this script has no usable copy. To replace it, add${NC}\n"
             printf "   ${DIM}--admin-token-recovery-http-bind=127.0.0.1:8182 to the serve command in docker-compose.yml,${NC}\n"
@@ -1645,53 +1672,38 @@ load_webui_session_secret() {
     export INFLUXDB3_WEBUI_SESSION_SECRET="$WEBUI_SESSION_SECRET"
 }
 
-# Create the operator token after the health check, print it once, then save
-# it. On HTTP 409 the server already has a token this run never saw, and
-# regenerating one needs the existing token, so a copy saved by an earlier
-# run is the only fallback. That copy may belong to another cluster or data
-# directory, so it counts only when this server accepts it.
-# Sets: TOKEN, TOKEN_OK (a usable token is known), TOKEN_SAVED (it is on disk)
+# Create the operator token, print it once, save it. On 409 or a failed
+# request the saved copy is the fallback, if this server accepts it.
+# Sets: TOKEN, TOKEN_OK, TOKEN_IS_NEW, TOKEN_EXISTS, TOKEN_SAVED
 create_binary_operator_token() {
-    TOKEN_OK=false
     TOKEN_SAVED=false
+    SAVED_TOKEN=$(cat "$OPERATOR_TOKEN_FILE" 2>/dev/null) || SAVED_TOKEN=""
 
     printf "\n${BOLD}Creating operator token${NC}\n"
-    TOKEN=$(create_operator_token "" "$PORT") || true
-    case "$TOKEN" in
-        TOKEN_ALREADY_EXISTS)
-            SAVED_TOKEN=$(cat "$OPERATOR_TOKEN_FILE" 2>/dev/null) || SAVED_TOKEN=""
-            # /health answers 401 to a missing or wrong token on every
-            # version that embeds the UI, so one request validates the copy
-            if [ -n "$SAVED_TOKEN" ] && curl -sf --max-time 5 -o /dev/null -H "Authorization: Bearer $SAVED_TOKEN" "http://localhost:${PORT}/health"; then
-                printf "└─ The server already has an operator token; the copy saved in %s works\n" "$OPERATOR_TOKEN_FILE"
-                TOKEN="$SAVED_TOKEN"
-                TOKEN_OK=true
-                TOKEN_SAVED=true
-            elif [ -n "$SAVED_TOKEN" ]; then
-                printf "└─ ${YELLOW}The server already has an operator token, and it does not accept the copy saved in %s${NC}\n" "$OPERATOR_TOKEN_FILE"
-            else
-                printf "└─ ${YELLOW}The server already has an operator token, but this script has no copy of it${NC}\n"
-            fi
-            ;;
-        "$MANUAL_TOKEN_MSG")
-            printf "└─ ${YELLOW}Could not create an operator token${NC}\n"
-            ;;
-        *)
-            TOKEN_OK=true
-            printf "${BOLD}════════════════════════════════════════════════════════════${NC}\n"
-            printf "${BOLD}OPERATOR TOKEN: Save this token. It will not be shown again.${NC}\n"
-            printf "%s\n" "$TOKEN"
-            printf "${BOLD}════════════════════════════════════════════════════════════${NC}\n"
+    # /health answers 401 to a wrong token wherever the UI is embedded
+    resolve_operator_token "$PORT" "$SAVED_TOKEN" true
+    if [ "$TOKEN_IS_NEW" = true ]; then
+        print_operator_token_banner "$TOKEN"
 
-            # Persist after printing, so a failed write still leaves the user a copy
-            if write_private_file "$OPERATOR_TOKEN_FILE" "$TOKEN"; then
-                TOKEN_SAVED=true
-                printf "└─ Saved to %s\n" "$OPERATOR_TOKEN_FILE"
-            else
-                printf "└─ ${YELLOW}Warning: Could not save the token to %s. Keep the copy shown above.${NC}\n" "$OPERATOR_TOKEN_FILE"
-            fi
-            ;;
-    esac
+        # Persist after printing, so a failed write still leaves the user a copy
+        if write_private_file "$OPERATOR_TOKEN_FILE" "$TOKEN"; then
+            TOKEN_SAVED=true
+            printf "└─ Saved to %s\n" "$OPERATOR_TOKEN_FILE"
+        else
+            printf "└─ ${YELLOW}Warning: Could not save the token to %s. Keep the copy shown above.${NC}\n" "$OPERATOR_TOKEN_FILE"
+        fi
+    elif [ "$TOKEN_OK" = true ]; then
+        printf "└─ The server already has an operator token; the copy saved in %s works\n" "$OPERATOR_TOKEN_FILE"
+        TOKEN_SAVED=true
+    elif [ -z "$SAVED_TOKEN" ] && [ "$TOKEN_EXISTS" = true ]; then
+        printf "└─ ${YELLOW}The server already has an operator token, but this script has no copy of it${NC}\n"
+    elif [ -z "$SAVED_TOKEN" ]; then
+        printf "└─ ${YELLOW}Could not create an operator token${NC}\n"
+    elif [ "$TOKEN_EXISTS" = true ]; then
+        printf "└─ ${YELLOW}The server already has an operator token, and it does not accept the copy saved in %s${NC}\n" "$OPERATOR_TOKEN_FILE"
+    else
+        printf "└─ ${YELLOW}Could not create an operator token, and the server did not accept the copy saved in %s${NC}\n" "$OPERATOR_TOKEN_FILE"
+    fi
 }
 
 # Smoke check for the embedded UI. The server loads the UI before its HTTP
@@ -2201,7 +2213,7 @@ else
             printf "│  2. Paste your operator token ${DIM}(saved in %s)${NC}\n" "$OPERATOR_TOKEN_FILE"
         elif [ "$TOKEN_OK" = true ]; then
             printf "│  2. Paste your operator token ${DIM}(shown above; it could not be saved to %s)${NC}\n" "$OPERATOR_TOKEN_FILE"
-        elif [ "$TOKEN" = "TOKEN_ALREADY_EXISTS" ]; then
+        elif [ "$TOKEN_EXISTS" = true ]; then
             printf "│  2. Paste the operator token from your earlier install\n"
             printf "│     ${DIM}This server already has one, and this script has no usable copy. To replace it, restart${NC}\n"
             printf "│     ${DIM}the server with --admin-token-recovery-http-bind (default 127.0.0.1:8182), then run:${NC}\n"
