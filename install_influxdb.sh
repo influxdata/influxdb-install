@@ -86,7 +86,7 @@
 #
 #   Docker Compose Specific:
 #     Port Selection:     Automatic via find_next_available_port()
-#     Session Secret:     Generated via openssl or date hash
+#     Session Secret:     64 hex characters from /dev/urandom
 #     InfluxDB Port:      Default 8181 (mapped to container 8181)
 #     Explorer Port:      Default 8888 (mapped to container 8080)
 #     Container Restart:  unless-stopped policy
@@ -364,13 +364,21 @@ open_browser_url() {
 
 # --- Security Utilities ---
 
-# Utility function to generate session secret
+# Exits 0 when $1 is 64 hex characters
+is_session_secret() {
+    [ "${#1}" -eq 64 ] || return 1
+    case "$1" in
+        *[!0-9a-fA-F]*) return 1 ;;
+    esac
+    return 0
+}
+
+# Prints 32 random bytes as 64 hex characters
+# Returns: 1 when generation fails (sh -e ignores a failed pipeline stage)
 generate_session_secret() {
-    if [ "${OS}" = "Darwin" ]; then
-        head -c 64 /dev/urandom | shasum -a 256 | cut -d ' ' -f 1
-    else
-        head -c 64 /dev/urandom | sha256sum | cut -d ' ' -f 1
-    fi
+    GENERATED_SECRET=$(head -c 32 /dev/urandom | od -An -v -tx1 | tr -d ' \n')
+    is_session_secret "$GENERATED_SECRET" || return 1
+    printf '%s\n' "$GENERATED_SECRET"
 }
 
 # ==============================================================================
@@ -912,10 +920,16 @@ setup_docker_compose() {
     INFLUXDB_PORT=$(find_next_available_port "$INFLUXDB_PORT")
     EXPLORER_PORT=$(find_next_available_port "$EXPLORER_PORT")
 
-    # Reuse the session secret and operator token from a previous run
+    # Reuse the session secret (unless malformed) and operator token from a previous run
     SESSION_SECRET=$(read_env_value "$DOCKER_DIR/.env" "SESSION_SECRET") || SESSION_SECRET=""
-    if [ -z "$SESSION_SECRET" ]; then
-        SESSION_SECRET=$(generate_session_secret)
+    if ! is_session_secret "$SESSION_SECRET"; then
+        if [ -n "$SESSION_SECRET" ]; then
+            printf "├─${YELLOW} Warning: SESSION_SECRET in %s/.env is not a usable session secret; generating a new one${NC}\n" "$DOCKER_DIR"
+        fi
+        if ! SESSION_SECRET=$(generate_session_secret); then
+            printf "└─ ${RED}Error: Could not generate a session secret from /dev/urandom${NC}\n\n"
+            return 1
+        fi
     fi
     TOKEN=$(read_env_value "$DOCKER_DIR/.env" "INFLUXDB_TOKEN") || TOKEN=""
     if [ -z "$TOKEN" ]; then
