@@ -1598,11 +1598,9 @@ display_enterprise_manual_command() {
     printf "     --license-type=%s \\\\\n" "${LICENSE_TYPE:-trial}"
     printf "     --license-email=%s \\\\\n" "${LICENSE_EMAIL:-your@email.com}"
     if [ "$USE_EMBEDDED_UI" = true ]; then
-        # The UI URL printed alongside names this port, so the command binds
-        # it. Older versions keep the baseline command, which omits the bind.
         printf "     --mode=all,webui \\\\\n"
-        printf "     --http-bind=0.0.0.0:%s \\\\\n" "$PORT"
     fi
+    printf "     --http-bind=0.0.0.0:%s \\\\\n" "$PORT"
     printf "     %s\n" "${STORAGE_FLAGS_ECHO:-"--object-store=file --data-dir $INSTALL_LOC/data --plugin-dir $INSTALL_LOC/plugins"}"
 }
 
