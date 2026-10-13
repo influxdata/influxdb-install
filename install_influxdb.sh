@@ -129,6 +129,8 @@
 #       session secret through INFLUXDB3_WEBUI_SESSION_SECRET; the UI runs
 #       inside the server, so the server URL to add in it is always
 #       http://localhost:8181 whatever host port is published
+#     - Operator token: creation is attempted on every run; on 409 the .env
+#       copy is checked against /health (embedded UI) or trusted (Explorer)
 #     - Opens Explorer UI in default browser upon successful startup
 #     - Filters verbose docker compose output for cleaner display
 #
@@ -994,7 +996,8 @@ setup_docker_compose() {
     printf "├─ Creating directories\n"
     create_docker_directories "$DOCKER_DIR" "$USE_EMBEDDED_UI"
 
-    # Stop any existing containers before reconfiguring
+    # Stop any existing containers before reconfiguring; the old file is
+    # what removes an older layout's Explorer container
     if [ -f "$DOCKER_DIR/docker-compose.yml" ]; then
         printf "├─ Stopping existing containers\n"
         cd "$DOCKER_DIR"
@@ -1045,49 +1048,64 @@ setup_docker_compose() {
         return 1
     fi
 
-    docker compose up -d "$CONTAINER_NAME" 2>&1 | filter_docker_output
+    docker compose up -d --remove-orphans "$CONTAINER_NAME" 2>&1 | filter_docker_output
 
     # Wait for InfluxDB to be ready
     if ! wait_for_container_ready "$CONTAINER_NAME" "startup time:" 60 "$EDITION_TYPE" "$LICENSE_TYPE"; then
         return 1
     fi
 
-    # Reuse the token read above, or create a new one
+    # Try to create a token first; a 409 means one exists, and the saved
+    # copy counts only if the server accepts it (checked via /health where
+    # the UI is embedded, trusted elsewhere)
     TOKEN_IS_NEW=false
     TOKEN_OK=false           # a usable token is known, new or reused
     TOKEN_SAVED=false        # that token is in .env; a reused token already is
     EXPLORER_DEPLOYED=false  # Explorer container answered its health check
     UI_READY=false           # embedded Explorer UI answered the smoke check
+    SAVED_TOKEN="$TOKEN"
 
-    if [ -n "$TOKEN" ]; then
-        printf "└─ Found existing operator token\n\n"
-    else
-        printf "└─ Creating operator token\n"
-        TOKEN=$(create_operator_token "$CONTAINER_NAME")
-        TOKEN_IS_NEW=true
-        printf "\n"
-    fi
-
-    # Display token BEFORE launching Explorer (only if newly created)
-    if [ "$TOKEN" != "$MANUAL_TOKEN_MSG" ] && [ "$TOKEN" != "TOKEN_ALREADY_EXISTS" ]; then
-        TOKEN_OK=true
-        if [ "$TOKEN_IS_NEW" = true ]; then
-            printf "${BOLD}════════════════════════════════════════════════════════════${NC}\n"
-            printf "${BOLD}OPERATOR TOKEN: Save this token. It will not be shown again.${NC}\n"
-            printf "%s\n" "$TOKEN"
-            printf "${BOLD}════════════════════════════════════════════════════════════${NC}\n\n"
-
-            # Persist after printing, so a failed write still leaves the user a copy
-            if write_env_file "$EDITION_TYPE" "$SESSION_SECRET" "$LICENSE_EMAIL" "$TOKEN" "$DOCKER_DIR"; then
-                TOKEN_SAVED=true
+    printf "└─ Creating operator token\n"
+    TOKEN=$(create_operator_token "$CONTAINER_NAME") || true
+    case "$TOKEN" in
+        TOKEN_ALREADY_EXISTS|"$MANUAL_TOKEN_MSG")
+            if [ -z "$SAVED_TOKEN" ]; then
+                if [ "$TOKEN" = "TOKEN_ALREADY_EXISTS" ]; then
+                    printf "   ${YELLOW}The server already has an operator token, but this script has no copy of it${NC}\n"
+                else
+                    printf "   ${YELLOW}Could not create an operator token${NC}\n"
+                fi
+            elif [ "$USE_EMBEDDED_UI" = false ] || curl -sf --max-time 5 -o /dev/null -H "Authorization: Bearer $SAVED_TOKEN" "http://localhost:${INFLUXDB_PORT}/health"; then
+                printf "   Found existing operator token\n"
+                TOKEN="$SAVED_TOKEN"
+                TOKEN_OK=true
+                TOKEN_SAVED=true  # already in .env from the earlier write
+            elif [ "$TOKEN" = "TOKEN_ALREADY_EXISTS" ]; then
+                printf "   ${YELLOW}The server already has an operator token, and it does not accept the copy saved in %s/.env${NC}\n" "$DOCKER_DIR"
             else
-                printf "${YELLOW}Warning: Could not save the token to %s${NC}\n" "$DOCKER_DIR/.env"
-                printf "${YELLOW}Keep the copy shown above. The next run may not be able to reuse it.${NC}\n\n"
+                printf "   ${YELLOW}Could not create an operator token, and the server did not accept the copy saved in %s/.env${NC}\n" "$DOCKER_DIR"
             fi
-        else
-            # A reused token was written to .env by the earlier write, which
-            # is fatal when it fails, so reaching here means it is on disk.
+            ;;
+        *)
+            TOKEN_IS_NEW=true
+            TOKEN_OK=true
+            ;;
+    esac
+    printf "\n"
+
+    # Display a new token BEFORE launching Explorer
+    if [ "$TOKEN_IS_NEW" = true ]; then
+        printf "${BOLD}════════════════════════════════════════════════════════════${NC}\n"
+        printf "${BOLD}OPERATOR TOKEN: Save this token. It will not be shown again.${NC}\n"
+        printf "%s\n" "$TOKEN"
+        printf "${BOLD}════════════════════════════════════════════════════════════${NC}\n\n"
+
+        # Persist after printing, so a failed write still leaves the user a copy
+        if write_env_file "$EDITION_TYPE" "$SESSION_SECRET" "$LICENSE_EMAIL" "$TOKEN" "$DOCKER_DIR"; then
             TOKEN_SAVED=true
+        else
+            printf "${YELLOW}Warning: Could not save the token to %s${NC}\n" "$DOCKER_DIR/.env"
+            printf "${YELLOW}Keep the copy shown above. The next run may not be able to reuse it.${NC}\n\n"
         fi
     fi
 
@@ -1168,8 +1186,12 @@ setup_docker_compose() {
         elif [ "$TOKEN_OK" = true ]; then
             printf "3. Paste your operator token ${DIM}(shown above; it could not be saved to %s/.env)${NC}\n\n" "$DOCKER_DIR"
         elif [ "$TOKEN" = "TOKEN_ALREADY_EXISTS" ]; then
-            printf "3. Paste your operator token\n"
-            printf "   ${DIM}One already exists for this data directory, but this script has no copy of it${NC}\n\n"
+            printf "3. Paste the operator token from your earlier install\n"
+            printf "   ${DIM}This server already has one, and this script has no usable copy. To replace it, add${NC}\n"
+            printf "   ${DIM}--admin-token-recovery-http-bind=127.0.0.1:8182 to the serve command in docker-compose.yml,${NC}\n"
+            printf "   ${DIM}run docker compose up -d, then run:${NC}\n"
+            printf "   ${DIM}docker exec -it %s influxdb3 create token --admin --regenerate --host http://127.0.0.1:8182${NC}\n" "$CONTAINER_NAME"
+            printf "   ${DIM}Save the new token as INFLUXDB_TOKEN in %s/.env so the next run can reuse it${NC}\n\n" "$DOCKER_DIR"
         else
             printf "3. Create an operator token, then paste it:\n"
             printf "   ${DIM}docker exec %s influxdb3 create token --admin${NC}\n\n" "$CONTAINER_NAME"
