@@ -11,7 +11,7 @@
 #
 # INSTALLATION METHODS:
 #   1. Docker Compose: Complete stack (InfluxDB + Explorer UI)
-#      - Installs latest Docker images
+#      - Pins InfluxDB to the version set in this script, or to --version
 #      - Auto-creates docker-compose.yml with proper networking
 #      - Manages Explorer configuration and session secrets
 #      - Supports upgrades of existing Docker installations
@@ -61,7 +61,7 @@
 #     - Detects existing docker-compose.yml at ~/.influxdb/docker/
 #     - Automatically upgrades in-place when detected
 #     - Extracts and reuses existing port configuration from .env
-#     - Pulls latest images and restarts containers with health checks
+#     - Pulls the selected version and restarts containers with health checks
 #     - Preserves all data in bind-mounted directories
 #
 #   Binary:
@@ -72,9 +72,7 @@
 # CONFIGURATION OPTIONS:
 #   Command Line Arguments:
 #     [enterprise]        Install Enterprise edition (default: Core)
-#     --version VERSION   Specify the InfluxDB3 version. Binary installs default to the
-#                         version set below; Docker installs default to the latest
-#                         3.x image and only pin when --version is given.
+#     --version VERSION   Specify the InfluxDB3 version (default: the version set below)
 #
 #   Interactive Prompts (Binary Installation):
 #     Installation Type:  Docker Compose or Binary
@@ -184,7 +182,7 @@ INFLUXDB_VERSION="${INFLUXDB_OSS_VERSION}"
 print_usage() {
     printf "Usage: %s [enterprise] [--version VERSION]\n" "$0"
     printf "  enterprise: Install the Enterprise edition (optional)\n"
-    printf "  --version VERSION: Specify the InfluxDB version (binary default: %s; Docker default: latest)\n" "$INFLUXDB_VERSION"
+    printf "  --version VERSION: Specify the InfluxDB version (default: %s)\n" "$INFLUXDB_VERSION"
 }
 
 NEWLINE='
@@ -271,13 +269,8 @@ fi
 
 URL="https://dl.influxdata.com/influxdb/releases/influxdb3-${EDITION_TAG}-${INFLUXDB_VERSION}_${ARTIFACT}.tar.gz"
 
-# Docker image. Specify the requested version only when --version was given;
-# otherwise use the floating major tag, which tracks the latest release.
-if [ "${INFLUXDB_VERSION_FLAG_SET}" = "1" ]; then
-    DOCKER_IMAGE="influxdb:${INFLUXDB_VERSION}-${EDITION_TAG}"
-else
-    DOCKER_IMAGE="influxdb:3-${EDITION_TAG}"
-fi
+# Docker image, pinned to the selected version (never the floating 3-<edition> tag).
+DOCKER_IMAGE="influxdb:${INFLUXDB_VERSION}-${EDITION_TAG}"
 
 
 
@@ -377,7 +370,7 @@ is_missing_image_error() {
 # It runs on the CLI host and bypasses daemon mirrors and proxies, so only a
 # definitive "tag missing" answer is treated as fatal. Any other failure is a
 # warning and the later pull, which goes through the daemon, decides.
-# Uses the globals DOCKER_IMAGE, EDITION, and INFLUXDB_VERSION.
+# Uses the globals DOCKER_IMAGE, EDITION, INFLUXDB_VERSION, and INFLUXDB_VERSION_FLAG_SET.
 # Returns: 1 if the registry reports the tag missing, 0 otherwise
 check_docker_image() {
     printf "├─ Checking that %s is available..." "$DOCKER_IMAGE"
@@ -391,7 +384,11 @@ check_docker_image() {
         printf "${RED}FAILED${NC}\n"
         printf "\n${RED}Error:${NC} InfluxDB 3 %s %s was not found on Docker Hub.\n" "$EDITION" "$INFLUXDB_VERSION" >&2
         printf "No image tagged '%s'.\n" "$DOCKER_IMAGE" >&2
-        printf "Check the version passed with --version, or omit it to install the latest release.\n\n" >&2
+        if [ "${INFLUXDB_VERSION_FLAG_SET}" = "1" ]; then
+            printf "Check the version passed with --version.\n\n" >&2
+        else
+            printf "This script defaults to %s, which has no Docker image yet. Pass --version to install another release.\n\n" "$INFLUXDB_VERSION" >&2
+        fi
         return 1
     fi
 
@@ -437,7 +434,11 @@ pull_docker_image() {
             printf "${BOLD}Possible causes:${NC}\n"
             if is_missing_image_error "$PULL_OUTPUT"; then
                 printf "  • The image tag does not exist on Docker Hub\n"
-                printf "  • Check the version passed with --version, or omit it to install the latest release\n"
+                if [ "${INFLUXDB_VERSION_FLAG_SET}" = "1" ]; then
+                    printf "  • Check the version passed with --version\n"
+                else
+                    printf "  • This script defaults to %s, which has no Docker image yet; pass --version to install another release\n" "$INFLUXDB_VERSION"
+                fi
             elif echo "$PULL_OUTPUT" | grep -qi "denied\|unauthorized"; then
                 printf "  • Docker Hub authentication required or rate limited\n"
                 printf "  • Try: docker login\n"
@@ -783,12 +784,9 @@ setup_docker_compose() {
         return 1
     fi
 
-    # Fail fast on an unknown version before prompting or touching an existing stack.
-    # The floating 3-<edition> tag always exists, so only check a pinned version.
-    if [ "${INFLUXDB_VERSION_FLAG_SET}" = "1" ]; then
-        if ! check_docker_image; then
-            return 1
-        fi
+    # Fail fast on a missing image before prompting or touching an existing stack.
+    if ! check_docker_image; then
+        return 1
     fi
 
     # Enterprise-specific: Handle license prompting
