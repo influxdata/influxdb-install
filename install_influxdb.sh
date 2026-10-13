@@ -524,12 +524,6 @@ wait_for_container_ready() {
             return 1
         fi
 
-        if [ $ELAPSED -eq $((TIMEOUT - 1)) ]; then
-            printf "${NC}\n"
-            printf "├─${RED} Error: InfluxDB failed to start within ${TIMEOUT} seconds${NC}\n"
-            return 1
-        fi
-
         # Show email verification message after 4 seconds for Enterprise with new license
         if [ "$EDITION_TYPE" = "enterprise" ] && [ -n "$LICENSE_TYPE" ] && \
            [ $ELAPSED -ge 4 ] && [ "$EMAIL_MESSAGE_SHOWN" = "false" ]; then
@@ -544,6 +538,11 @@ wait_for_container_ready() {
         sleep 2
         ELAPSED=$((ELAPSED + 2))
     done
+
+    printf "${NC}\n"
+    printf "├─${RED} Error: InfluxDB failed to start within ${TIMEOUT} seconds${NC}\n"
+    docker logs --tail 20 "$CONTAINER_NAME"
+    return 1
 }
 
 # Utility function to wait for Explorer to be fully ready
