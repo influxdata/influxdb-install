@@ -822,7 +822,10 @@ setup_docker_compose() {
     if [ -f "$DOCKER_DIR/docker-compose.yml" ]; then
         printf "├─ Stopping existing containers\n"
         cd "$DOCKER_DIR"
-        docker compose down 2>/dev/null || true
+        if ! DOWN_OUTPUT=$(docker compose down 2>&1); then
+            printf "├─${YELLOW} Warning: could not stop the existing containers; they may still be running${NC}\n"
+            printf "%s\n" "$DOWN_OUTPUT" | sed 's/^/│  /'
+        fi
         cd - > /dev/null
     fi
 
