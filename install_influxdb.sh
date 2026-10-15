@@ -60,7 +60,7 @@
 #   Docker Compose:
 #     - Detects existing docker-compose.yml at ~/.influxdb/docker/
 #     - Automatically upgrades in-place when detected
-#     - Reuses the license email and type from .env
+#     - Reuses the license email and type and the session secret from .env
 #     - Pulls the selected version and restarts containers with health checks
 #     - Preserves all data in bind-mounted directories
 #
@@ -86,7 +86,7 @@
 #
 #   Docker Compose Specific:
 #     Port Selection:     Automatic via find_next_available_port()
-#     Session Secret:     Generated via openssl or date hash
+#     Session Secret:     64 hex characters from /dev/urandom; reused from .env on re-run
 #     InfluxDB Port:      Default 8181 (mapped to container 8181)
 #     Explorer Port:      Default 8888 (mapped to container 8080)
 #     Container Restart:  unless-stopped policy
@@ -389,13 +389,21 @@ open_browser_url() {
 
 # --- Security Utilities ---
 
-# Utility function to generate session secret
+# Exits 0 when $1 is 64 hex characters
+is_session_secret() {
+    [ "${#1}" -eq 64 ] || return 1
+    case "$1" in
+        *[!0-9a-fA-F]*) return 1 ;;
+    esac
+    return 0
+}
+
+# Prints 32 random bytes as 64 hex characters
+# Returns: 1 when generation fails (sh -e ignores a failed pipeline stage)
 generate_session_secret() {
-    if [ "${OS}" = "Darwin" ]; then
-        head -c 64 /dev/urandom | shasum -a 256 | cut -d ' ' -f 1
-    else
-        head -c 64 /dev/urandom | sha256sum | cut -d ' ' -f 1
-    fi
+    GENERATED_SECRET=$(head -c 32 /dev/urandom | od -An -v -tx1 | tr -d ' \n')
+    is_session_secret "$GENERATED_SECRET" || return 1
+    printf '%s\n' "$GENERATED_SECRET"
 }
 
 # --- Startup Messages ---
@@ -913,7 +921,7 @@ extract_token_from_explorer_config() {
 
     if [ -f "$CONFIG_FILE" ]; then
         TOKEN=$(grep '"DEFAULT_API_TOKEN"' "$CONFIG_FILE" | cut -d'"' -f4)
-        if [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ]; then
+        if [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ] && [ "$TOKEN" != "YOUR_TOKEN_HERE" ]; then
             echo "$TOKEN"
             return 0
         fi
@@ -1013,8 +1021,18 @@ setup_docker_compose() {
     INFLUXDB_PORT=$(find_next_available_port "$INFLUXDB_PORT")
     EXPLORER_PORT=$(find_next_available_port "$EXPLORER_PORT")
 
-    # Generate session secret
-    SESSION_SECRET=$(generate_session_secret)
+    # Reuse the session secret from a previous run unless it is malformed,
+    # so Explorer sessions survive a re-run
+    SESSION_SECRET=$(read_env_value "$DOCKER_DIR/.env" "SESSION_SECRET") || SESSION_SECRET=""
+    if ! is_session_secret "$SESSION_SECRET"; then
+        if [ -n "$SESSION_SECRET" ]; then
+            printf "├─${YELLOW} Warning: SESSION_SECRET in %s/.env is not a usable session secret; generating a new one${NC}\n" "$DOCKER_DIR"
+        fi
+        if ! SESSION_SECRET=$(generate_session_secret); then
+            printf "└─ ${RED}Error: Could not generate a session secret from /dev/urandom${NC}\n\n"
+            return 1
+        fi
+    fi
 
     # Keep the stored email and license type when an existing license file skipped the prompt
     if [ "$EDITION_TYPE" = "enterprise" ] && [ -z "$LICENSE_EMAIL" ]; then
