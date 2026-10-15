@@ -31,7 +31,7 @@
 #   Docker Compose specific:
 #     ~/.influxdb/docker/
 #       ├── docker-compose.yml     (Docker service definitions)
-#       ├── .env                   (Environment variables)
+#       ├── .env                   (License email and type, session secret)
 #       └── explorer/
 #           ├── db/                (Explorer database)
 #           └── config/            (Explorer configuration)
@@ -60,7 +60,7 @@
 #   Docker Compose:
 #     - Detects existing docker-compose.yml at ~/.influxdb/docker/
 #     - Automatically upgrades in-place when detected
-#     - Extracts and reuses existing port configuration from .env
+#     - Reuses the license email and type from .env
 #     - Pulls the selected version and restarts containers with health checks
 #     - Preserves all data in bind-mounted directories
 #
@@ -90,6 +90,8 @@
 #     InfluxDB Port:      Default 8181 (mapped to container 8181)
 #     Explorer Port:      Default 8888 (mapped to container 8080)
 #     Container Restart:  unless-stopped policy
+#     License Type:       (Enterprise only) Passed as INFLUXDB3_ENTERPRISE_LICENSE_TYPE
+#                         from .env; omitted when unknown (older .env)
 #
 # EXIT POINTS AND CONDITIONS:
 #   Successful Exits (exit 0):
@@ -562,12 +564,18 @@ create_docker_directories() {
 # --- Health Checks ---
 
 # Utility function to wait for container to be ready
+# Parameters:
+#   $1 - container name
+#   $2 - log line that marks the server as ready
+#   $3 - timeout in seconds (default 60)
+#   $4 - edition: "core" or "enterprise"
+#   $5 - non-empty when this run requested a new license (shows the email notice)
 wait_for_container_ready() {
     CONTAINER_NAME="$1"
     READY_MESSAGE="$2"
     TIMEOUT="${3:-60}"
     EDITION_TYPE="${4:-}"
-    LICENSE_TYPE="${5:-}"
+    NEW_LICENSE="${5:-}"
 
     printf "├─ Starting InfluxDB"
     ELAPSED=0
@@ -587,7 +595,7 @@ wait_for_container_ready() {
         fi
 
         # Show email verification message after 4 seconds for Enterprise with new license
-        if [ "$EDITION_TYPE" = "enterprise" ] && [ -n "$LICENSE_TYPE" ] && \
+        if [ "$EDITION_TYPE" = "enterprise" ] && [ -n "$NEW_LICENSE" ] && \
            [ $ELAPSED -ge 4 ] && [ "$EMAIL_MESSAGE_SHOWN" = "false" ]; then
             printf "${NC}\n"
             printf "├─${YELLOW} License activation requires email verification${NC}\n"
@@ -680,11 +688,14 @@ create_operator_token() {
 # --- Configuration Generation ---
 
 # Function to generate Docker Compose YAML
+# Parameters:
+#   $1 - edition: "core" or "enterprise"
+#   $2 - docker directory
+#   $3 - license type ("trial", "home", or empty when unknown; Enterprise only)
 generate_docker_compose_yaml() {
-    EDITION_TYPE="$1"  # "core" or "enterprise"
-    SESSION_SECRET="$2"
-    LICENSE_EMAIL="$3"
-    DOCKER_DIR="$4"
+    EDITION_TYPE="$1"
+    DOCKER_DIR="$2"
+    COMPOSE_LICENSE_TYPE="${3:-}"
 
     USER_UID=$(id -u)
     USER_GID=$(id -g)
@@ -695,6 +706,12 @@ generate_docker_compose_yaml() {
         CLUSTER_ARG="      - --cluster-id=cluster0"
         ENV_SECTION="    environment:
       - INFLUXDB3_ENTERPRISE_LICENSE_EMAIL=\${INFLUXDB_EMAIL}"
+        # Only when known: the server exits on an empty --license-type, and
+        # compose substitutes an empty string for a key missing from .env
+        if [ -n "$COMPOSE_LICENSE_TYPE" ]; then
+            ENV_SECTION="${ENV_SECTION}
+      - INFLUXDB3_ENTERPRISE_LICENSE_TYPE=\${INFLUXDB_LICENSE_TYPE}"
+        fi
     else
         SERVICE_NAME="influxdb3-core"
         CLUSTER_ARG=""
@@ -746,21 +763,58 @@ networks:
   influxdb-network:
     driver: bridge
 COMPOSE_EOF
+}
 
-    # Create .env file
+# Function to write the Docker .env file
+# Parameters:
+#   $1 - edition: "core" or "enterprise"
+#   $2 - session secret
+#   $3 - license email (Enterprise only)
+#   $4 - docker directory
+#   $5 - license type, or empty when unknown (Enterprise only)
+# Returns: 0 on success, 1 when the file cannot be written
+write_env_file() {
+    EDITION_TYPE="$1"
+    SESSION_SECRET="$2"
+    LICENSE_EMAIL="$3"
+    DOCKER_DIR="$4"
+    ENV_LICENSE_TYPE="${5:-}"
+
+    ENV_CONTENT="SESSION_SECRET=${SESSION_SECRET}"
     if [ "$EDITION_TYPE" = "enterprise" ]; then
-        cat > "$DOCKER_DIR/.env" << ENV_EOF
-INFLUXDB_EMAIL=${LICENSE_EMAIL}
-SESSION_SECRET=${SESSION_SECRET}
-ENV_EOF
-    else
-        cat > "$DOCKER_DIR/.env" << ENV_EOF
-SESSION_SECRET=${SESSION_SECRET}
-ENV_EOF
+        if [ -n "$ENV_LICENSE_TYPE" ]; then
+            ENV_CONTENT="INFLUXDB_LICENSE_TYPE=${ENV_LICENSE_TYPE}
+${ENV_CONTENT}"
+        fi
+        ENV_CONTENT="INFLUXDB_EMAIL=${LICENSE_EMAIL}
+${ENV_CONTENT}"
     fi
 
-    # Set restrictive permissions on .env file
-    chmod 600 "$DOCKER_DIR/.env"
+    # umask protects a new file; chmod covers an existing one
+    (
+        umask 077
+        printf '%s\n' "$ENV_CONTENT" > "$DOCKER_DIR/.env"
+    ) && chmod 600 "$DOCKER_DIR/.env"
+}
+
+# Utility function to read one single-line value from the Docker .env file
+# Parameters:
+#   $1 - env file path
+#   $2 - key
+# Returns: 1 when the file or key is missing
+read_env_value() {
+    ENV_FILE="$1"
+    KEY="$2"
+
+    if [ ! -f "$ENV_FILE" ]; then
+        return 1
+    fi
+    VALUE=$(grep "^${KEY}=" "$ENV_FILE" 2>/dev/null | tail -n1 | cut -d'=' -f2-)
+    if [ -z "$VALUE" ]; then
+        return 1
+    fi
+    echo "$VALUE"
+    return 0
 }
 
 # Function to configure Explorer via file
@@ -817,6 +871,7 @@ setup_docker_compose() {
     DOCKER_DIR="${2:-$HOME/.influxdb/docker}"
     LICENSE_EMAIL="$3"
     LICENSE_TYPE="$4"
+    LICENSE_PROMPTED=""  # set when the prompt runs
 
     # Set edition-specific values
     if [ "$EDITION_TYPE" = "enterprise" ]; then
@@ -867,6 +922,7 @@ setup_docker_compose() {
                 2) LICENSE_TYPE="home" ;;
                 *) LICENSE_TYPE="trial" ;;
             esac
+            LICENSE_PROMPTED="$LICENSE_TYPE"
 
             printf "Enter your email: "
             read -r LICENSE_EMAIL
@@ -898,8 +954,27 @@ setup_docker_compose() {
     # Generate session secret
     SESSION_SECRET=$(generate_session_secret)
 
+    # Keep the stored email and license type when an existing license file skipped the prompt
+    if [ "$EDITION_TYPE" = "enterprise" ] && [ -z "$LICENSE_EMAIL" ]; then
+        LICENSE_EMAIL=$(read_env_value "$DOCKER_DIR/.env" "INFLUXDB_EMAIL") || LICENSE_EMAIL=""
+    fi
+    if [ "$EDITION_TYPE" = "enterprise" ] && [ -z "$LICENSE_TYPE" ]; then
+        LICENSE_TYPE=$(read_env_value "$DOCKER_DIR/.env" "INFLUXDB_LICENSE_TYPE") || LICENSE_TYPE=""
+        case "$LICENSE_TYPE" in
+            trial|home|"") ;;
+            *)
+                printf "├─${YELLOW} Warning: INFLUXDB_LICENSE_TYPE in %s/.env is not trial or home; ignoring it${NC}\n" "$DOCKER_DIR"
+                LICENSE_TYPE=""
+                ;;
+        esac
+    fi
+
     printf "├─ Creating docker-compose.yml (%s)\n" "$DOCKER_IMAGE"
-    generate_docker_compose_yaml "$EDITION_TYPE" "$SESSION_SECRET" "$LICENSE_EMAIL" "$DOCKER_DIR"
+    generate_docker_compose_yaml "$EDITION_TYPE" "$DOCKER_DIR" "$LICENSE_TYPE"
+    if ! write_env_file "$EDITION_TYPE" "$SESSION_SECRET" "$LICENSE_EMAIL" "$DOCKER_DIR" "$LICENSE_TYPE"; then
+        printf "└─ ${RED}Error: Could not write %s${NC}\n\n" "$DOCKER_DIR/.env"
+        return 1
+    fi
 
     cd "$DOCKER_DIR"
 
@@ -911,7 +986,7 @@ setup_docker_compose() {
     docker compose up -d "$CONTAINER_NAME" 2>&1 | filter_docker_output
 
     # Wait for InfluxDB to be ready
-    if ! wait_for_container_ready "$CONTAINER_NAME" "startup time:" 60 "$EDITION_TYPE" "$LICENSE_TYPE"; then
+    if ! wait_for_container_ready "$CONTAINER_NAME" "startup time:" 60 "$EDITION_TYPE" "$LICENSE_PROMPTED"; then
         return 1
     fi
 
