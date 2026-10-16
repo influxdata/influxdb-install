@@ -348,6 +348,25 @@ check_release_url() {
     esac
 }
 
+# Download a URL to a file; exit on HTTP or network error. No overall
+# timeout: abort only on a stalled connection. HTTP/1.1 because macOS
+# curl 8.7.1 does not retry 5xx over HTTP/2 with -f.
+download_file() {
+    dl_url="$1"
+    dl_dest="$2"
+    dl_opts="-sSfL --http1.1 --connect-timeout 30 --speed-limit 1024 --speed-time 60 --retry 3"
+    printf "└─${DIM} curl %s '%s' -o '%s'${NC}\n" "$dl_opts" "$dl_url" "$dl_dest"
+    # shellcheck disable=SC2086  # intentional word-split
+    if ! dl_err=$(curl $dl_opts "$dl_url" -o "$dl_dest" 2>&1); then
+        printf "\n${RED}Error:${NC} Failed to download '%s'.\n" "$dl_url" >&2
+        printf "%s\n" "$dl_err" >&2
+        printf "Check your network or proxy, or retry later. If the problem persists, pass --version to choose another release.\n" >&2
+        # Best-effort cleanup; must not mask the error above.
+        [ -f "$dl_dest" ] && rm -f -- "$dl_dest" 2>/dev/null || :
+        exit 1
+    fi
+}
+
 # --- Browser Integration ---
 
 # Utility function to open URL in browser
@@ -1400,13 +1419,11 @@ printf "\n"
 printf "${BOLD}Downloading InfluxDB 3 %s to %s${NC}\n" "$EDITION" "$INSTALL_LOC"
 printf "├─${DIM} mkdir -p '%s'${NC}\n" "$INSTALL_LOC"
 mkdir -p "$INSTALL_LOC"
-printf "└─${DIM} curl -sSL '%s' -o '%s/influxdb3-${EDITION_TAG}.tar.gz'${NC}\n" "${URL}" "$INSTALL_LOC"
-curl -sSL "${URL}" -o "$INSTALL_LOC/influxdb3-${EDITION_TAG}.tar.gz"
+download_file "${URL}" "$INSTALL_LOC/influxdb3-${EDITION_TAG}.tar.gz"
 
 printf "\n"
 printf "${BOLD}Verifying '%s/influxdb3-${EDITION_TAG}.tar.gz'${NC}\n" "$INSTALL_LOC"
-printf "└─${DIM} curl -sSL '%s.sha256' -o '%s/influxdb3-${EDITION_TAG}.tar.gz.sha256'${NC}\n" "${URL}" "$INSTALL_LOC"
-curl -sSL "${URL}.sha256" -o "$INSTALL_LOC/influxdb3-${EDITION_TAG}.tar.gz.sha256"
+download_file "${URL}.sha256" "$INSTALL_LOC/influxdb3-${EDITION_TAG}.tar.gz.sha256"
 dl_sha=$(cut -d ' ' -f 1 "$INSTALL_LOC/influxdb3-${EDITION_TAG}.tar.gz.sha256" | grep -E '^[0-9a-f]{64}$')
 if [ -z "$dl_sha" ]; then
     printf "Could not find properly formatted SHA256 in '%s/influxdb3-${EDITION_TAG}.tar.gz.sha256'. Aborting.\n" "$INSTALL_LOC"
