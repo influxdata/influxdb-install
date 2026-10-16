@@ -31,7 +31,7 @@
 #   Docker Compose specific:
 #     ~/.influxdb/docker/
 #       ├── docker-compose.yml     (Docker service definitions)
-#       ├── .env                   (Environment variables)
+#       ├── .env                   (License email and type, session secret)
 #       └── explorer/
 #           ├── db/                (Explorer database)
 #           └── config/            (Explorer configuration)
@@ -60,7 +60,7 @@
 #   Docker Compose:
 #     - Detects existing docker-compose.yml at ~/.influxdb/docker/
 #     - Automatically upgrades in-place when detected
-#     - Extracts and reuses existing port configuration from .env
+#     - Reuses the license email and type from .env
 #     - Pulls the selected version and restarts containers with health checks
 #     - Preserves all data in bind-mounted directories
 #
@@ -90,6 +90,8 @@
 #     InfluxDB Port:      Default 8181 (mapped to container 8181)
 #     Explorer Port:      Default 8888 (mapped to container 8080)
 #     Container Restart:  unless-stopped policy
+#     License Type:       (Enterprise only) Passed as INFLUXDB3_ENTERPRISE_LICENSE_TYPE
+#                         from .env; omitted when unknown (older .env)
 #
 # EXIT POINTS AND CONDITIONS:
 #   Successful Exits (exit 0):
@@ -106,7 +108,7 @@
 #     - Requested version not found at the release URL (checked before download)
 #     - Failed binary download, signature verification, or extraction
 #     - Invalid SHA256 checksum on downloaded binary
-#     - Container startup timeout (>60 seconds for InfluxDB/Explorer)
+#     - Container startup timeout (30 seconds for Core, 90 for Enterprise, 60 for Explorer)
 #     - Port allocation failure or port range exhausted
 #
 # SPECIAL BEHAVIORS:
@@ -165,6 +167,10 @@ OS=""
 INSTALL_LOC=~/.influxdb
 BINARY_NAME="influxdb3"
 PORT=8181
+
+# Seconds to wait for the server to come up; shared by the binary and Docker paths
+readonly STARTUP_TIMEOUT_CORE=30
+readonly STARTUP_TIMEOUT_ENTERPRISE=90
 
 # Set the default (latest) version here. Users may specify a version using the
 # --version arg (handled below)
@@ -392,6 +398,47 @@ generate_session_secret() {
     fi
 }
 
+# --- Startup Messages ---
+# Shared by perform_server_health_check (binary) and wait_for_container_ready
+# (Docker) so both paths report the same thing while the server comes up.
+
+# Shown once, 10 seconds into startup, when this run requested a new license
+print_license_verification_notice() {
+    printf "├─${YELLOW} License activation requires email verification${NC}\n"
+    printf "├─${BOLD} → Check your inbox and click the verification link${NC}\n"
+}
+
+# Shown every 15 seconds while a new license is pending
+# Parameters:
+#   $1 - seconds waited so far
+#   $2 - timeout in seconds
+print_license_verification_progress() {
+    printf "├─${DIM} Waiting for license verification (%s/%ss)${NC}\n" "$1" "$2"
+}
+
+# Shown when the server has not come up within the timeout
+# Parameters:
+#   $1 - timeout in seconds
+#   $2 - "true" for Enterprise
+#   $3 - non-empty when this run requested a new license
+#   $4 - server port
+#   $5 - where to find the logs (a file path or a docker logs command)
+print_startup_timeout_error() {
+    if [ "$2" = "true" ]; then
+        printf "├─${BOLD} Error: InfluxDB Enterprise failed to start within %s seconds${NC}\n\n" "$1"
+        if [ -n "$3" ]; then
+            printf "   ├─${YELLOW} Check your email for license verification${NC} ${BOLD}(REQUIRED)${NC}\n"
+            printf "   │  ${BOLD}→ Click the verification link in your inbox${NC}\n"
+        fi
+        printf "   ├─ Check for network connectivity issues\n"
+        printf "   ├─ Check for port %s conflicts\n" "$4"
+        printf "   └─ Check the logs: %s\n" "$5"
+    else
+        printf "└─${BOLD} Error: InfluxDB failed to start; check permissions or other potential issues.${NC}\n"
+        printf "   Logs: %s\n" "$5"
+    fi
+}
+
 # ==============================================================================
 # SECTION 5: DOCKER COMPOSE UTILITIES
 # ==============================================================================
@@ -561,49 +608,72 @@ create_docker_directories() {
 
 # --- Health Checks ---
 
-# Utility function to wait for container to be ready
+# Utility function to wait for the InfluxDB container to be ready.
+# Mirrors perform_server_health_check on the binary path: same timeouts,
+# license verification notices, and timeout messages.
+# Parameters:
+#   $1 - container name
+#   $2 - log line that marks the server as ready
+#   $3 - timeout in seconds (default STARTUP_TIMEOUT_CORE)
+#   $4 - edition: "core" or "enterprise"
+#   $5 - non-empty when this run requested a new license (shows the email notice)
 wait_for_container_ready() {
     CONTAINER_NAME="$1"
     READY_MESSAGE="$2"
-    TIMEOUT="${3:-60}"
+    TIMEOUT="${3:-$STARTUP_TIMEOUT_CORE}"
     EDITION_TYPE="${4:-}"
-    LICENSE_TYPE="${5:-}"
+    NEW_LICENSE="${5:-}"
+    if [ "$EDITION_TYPE" = "enterprise" ]; then
+        IS_ENTERPRISE=true
+    else
+        IS_ENTERPRISE=false
+    fi
 
+    # Progress dots run until the first license message takes over the line
     printf "├─ Starting InfluxDB"
-    ELAPSED=0
+    DOTS_OPEN=true
     EMAIL_MESSAGE_SHOWN=false
 
-    while [ $ELAPSED -lt $TIMEOUT ]; do
+    for i in $(seq 1 "$TIMEOUT"); do
         if docker logs "$CONTAINER_NAME" 2>&1 | grep -q "$READY_MESSAGE"; then
-            printf "${NC}\n"
+            if [ "$DOTS_OPEN" = "true" ]; then printf "${NC}\n"; fi
             return 0
         fi
 
         if ! docker ps | grep -q "$CONTAINER_NAME"; then
-            printf "${NC}\n"
+            if [ "$DOTS_OPEN" = "true" ]; then printf "${NC}\n"; fi
             printf "├─${RED} Error: InfluxDB container stopped unexpectedly${NC}\n"
             docker logs --tail 20 "$CONTAINER_NAME"
             return 1
         fi
 
-        # Show email verification message after 4 seconds for Enterprise with new license
-        if [ "$EDITION_TYPE" = "enterprise" ] && [ -n "$LICENSE_TYPE" ] && \
-           [ $ELAPSED -ge 4 ] && [ "$EMAIL_MESSAGE_SHOWN" = "false" ]; then
+        # Show email verification message after 10 seconds for a new license
+        if [ "$IS_ENTERPRISE" = "true" ] && [ -n "$NEW_LICENSE" ] && [ "$i" -eq 10 ] && [ "$EMAIL_MESSAGE_SHOWN" = "false" ]; then
             printf "${NC}\n"
-            printf "├─${YELLOW} License activation requires email verification${NC}\n"
-            printf "├─${BOLD} → Check your inbox and verify your email address${NC}\n"
-            printf "├─ Continuing startup"
+            DOTS_OPEN=false
+            print_license_verification_notice
             EMAIL_MESSAGE_SHOWN=true
         fi
 
-        printf "."
-        sleep 2
-        ELAPSED=$((ELAPSED + 2))
+        # Show progress updates every 15 seconds after initial grace period
+        if [ "$IS_ENTERPRISE" = "true" ] && [ -n "$NEW_LICENSE" ] && [ "$i" -gt 5 ] && [ $((i % 15)) -eq 0 ]; then
+            print_license_verification_progress "$i" "$TIMEOUT"
+        fi
+
+        if [ "$DOTS_OPEN" = "true" ]; then printf "."; fi
+        sleep 1
     done
 
-    printf "${NC}\n"
-    printf "├─${RED} Error: InfluxDB failed to start within ${TIMEOUT} seconds${NC}\n"
-    docker logs --tail 20 "$CONTAINER_NAME"
+    if [ "$DOTS_OPEN" = "true" ]; then printf "${NC}\n"; fi
+    print_startup_timeout_error "$TIMEOUT" "$IS_ENTERPRISE" "$NEW_LICENSE" "$INFLUXDB_PORT" "docker logs $CONTAINER_NAME"
+
+    # Unlike the binary path, which stops its background process, the container
+    # is left running: once the license is verified it finishes starting on its own
+    if [ -n "$NEW_LICENSE" ] && docker ps | grep -q "$CONTAINER_NAME"; then
+        printf "\n"
+        printf "The %s container is still running and will finish starting once the license is verified.\n" "$CONTAINER_NAME"
+        printf "Re-run this script afterwards to finish setting up the operator token and Explorer.\n"
+    fi
     return 1
 }
 
@@ -680,11 +750,14 @@ create_operator_token() {
 # --- Configuration Generation ---
 
 # Function to generate Docker Compose YAML
+# Parameters:
+#   $1 - edition: "core" or "enterprise"
+#   $2 - docker directory
+#   $3 - license type ("trial", "home", or empty when unknown; Enterprise only)
 generate_docker_compose_yaml() {
-    EDITION_TYPE="$1"  # "core" or "enterprise"
-    SESSION_SECRET="$2"
-    LICENSE_EMAIL="$3"
-    DOCKER_DIR="$4"
+    EDITION_TYPE="$1"
+    DOCKER_DIR="$2"
+    COMPOSE_LICENSE_TYPE="${3:-}"
 
     USER_UID=$(id -u)
     USER_GID=$(id -g)
@@ -695,6 +768,12 @@ generate_docker_compose_yaml() {
         CLUSTER_ARG="      - --cluster-id=cluster0"
         ENV_SECTION="    environment:
       - INFLUXDB3_ENTERPRISE_LICENSE_EMAIL=\${INFLUXDB_EMAIL}"
+        # Only when known: the server exits on an empty --license-type, and
+        # compose substitutes an empty string for a key missing from .env
+        if [ -n "$COMPOSE_LICENSE_TYPE" ]; then
+            ENV_SECTION="${ENV_SECTION}
+      - INFLUXDB3_ENTERPRISE_LICENSE_TYPE=\${INFLUXDB_LICENSE_TYPE}"
+        fi
     else
         SERVICE_NAME="influxdb3-core"
         CLUSTER_ARG=""
@@ -746,21 +825,58 @@ networks:
   influxdb-network:
     driver: bridge
 COMPOSE_EOF
+}
 
-    # Create .env file
+# Function to write the Docker .env file
+# Parameters:
+#   $1 - edition: "core" or "enterprise"
+#   $2 - session secret
+#   $3 - license email (Enterprise only)
+#   $4 - docker directory
+#   $5 - license type, or empty when unknown (Enterprise only)
+# Returns: 0 on success, 1 when the file cannot be written
+write_env_file() {
+    EDITION_TYPE="$1"
+    SESSION_SECRET="$2"
+    LICENSE_EMAIL="$3"
+    DOCKER_DIR="$4"
+    ENV_LICENSE_TYPE="${5:-}"
+
+    ENV_CONTENT="SESSION_SECRET=${SESSION_SECRET}"
     if [ "$EDITION_TYPE" = "enterprise" ]; then
-        cat > "$DOCKER_DIR/.env" << ENV_EOF
-INFLUXDB_EMAIL=${LICENSE_EMAIL}
-SESSION_SECRET=${SESSION_SECRET}
-ENV_EOF
-    else
-        cat > "$DOCKER_DIR/.env" << ENV_EOF
-SESSION_SECRET=${SESSION_SECRET}
-ENV_EOF
+        if [ -n "$ENV_LICENSE_TYPE" ]; then
+            ENV_CONTENT="INFLUXDB_LICENSE_TYPE=${ENV_LICENSE_TYPE}
+${ENV_CONTENT}"
+        fi
+        ENV_CONTENT="INFLUXDB_EMAIL=${LICENSE_EMAIL}
+${ENV_CONTENT}"
     fi
 
-    # Set restrictive permissions on .env file
-    chmod 600 "$DOCKER_DIR/.env"
+    # umask protects a new file; chmod covers an existing one
+    (
+        umask 077
+        printf '%s\n' "$ENV_CONTENT" > "$DOCKER_DIR/.env"
+    ) && chmod 600 "$DOCKER_DIR/.env"
+}
+
+# Utility function to read one single-line value from the Docker .env file
+# Parameters:
+#   $1 - env file path
+#   $2 - key
+# Returns: 1 when the file or key is missing
+read_env_value() {
+    ENV_FILE="$1"
+    KEY="$2"
+
+    if [ ! -f "$ENV_FILE" ]; then
+        return 1
+    fi
+    VALUE=$(grep "^${KEY}=" "$ENV_FILE" 2>/dev/null | tail -n1 | cut -d'=' -f2-)
+    if [ -z "$VALUE" ]; then
+        return 1
+    fi
+    echo "$VALUE"
+    return 0
 }
 
 # Function to configure Explorer via file
@@ -817,6 +933,7 @@ setup_docker_compose() {
     DOCKER_DIR="${2:-$HOME/.influxdb/docker}"
     LICENSE_EMAIL="$3"
     LICENSE_TYPE="$4"
+    LICENSE_PROMPTED=""  # set when the prompt runs
 
     # Set edition-specific values
     if [ "$EDITION_TYPE" = "enterprise" ]; then
@@ -867,6 +984,7 @@ setup_docker_compose() {
                 2) LICENSE_TYPE="home" ;;
                 *) LICENSE_TYPE="trial" ;;
             esac
+            LICENSE_PROMPTED="$LICENSE_TYPE"
 
             printf "Enter your email: "
             read -r LICENSE_EMAIL
@@ -898,8 +1016,27 @@ setup_docker_compose() {
     # Generate session secret
     SESSION_SECRET=$(generate_session_secret)
 
+    # Keep the stored email and license type when an existing license file skipped the prompt
+    if [ "$EDITION_TYPE" = "enterprise" ] && [ -z "$LICENSE_EMAIL" ]; then
+        LICENSE_EMAIL=$(read_env_value "$DOCKER_DIR/.env" "INFLUXDB_EMAIL") || LICENSE_EMAIL=""
+    fi
+    if [ "$EDITION_TYPE" = "enterprise" ] && [ -z "$LICENSE_TYPE" ]; then
+        LICENSE_TYPE=$(read_env_value "$DOCKER_DIR/.env" "INFLUXDB_LICENSE_TYPE") || LICENSE_TYPE=""
+        case "$LICENSE_TYPE" in
+            trial|home|"") ;;
+            *)
+                printf "├─${YELLOW} Warning: INFLUXDB_LICENSE_TYPE in %s/.env is not trial or home; ignoring it${NC}\n" "$DOCKER_DIR"
+                LICENSE_TYPE=""
+                ;;
+        esac
+    fi
+
     printf "├─ Creating docker-compose.yml (%s)\n" "$DOCKER_IMAGE"
-    generate_docker_compose_yaml "$EDITION_TYPE" "$SESSION_SECRET" "$LICENSE_EMAIL" "$DOCKER_DIR"
+    generate_docker_compose_yaml "$EDITION_TYPE" "$DOCKER_DIR" "$LICENSE_TYPE"
+    if ! write_env_file "$EDITION_TYPE" "$SESSION_SECRET" "$LICENSE_EMAIL" "$DOCKER_DIR" "$LICENSE_TYPE"; then
+        printf "└─ ${RED}Error: Could not write %s${NC}\n\n" "$DOCKER_DIR/.env"
+        return 1
+    fi
 
     cd "$DOCKER_DIR"
 
@@ -910,8 +1047,13 @@ setup_docker_compose() {
 
     docker compose up -d "$CONTAINER_NAME" 2>&1 | filter_docker_output
 
-    # Wait for InfluxDB to be ready
-    if ! wait_for_container_ready "$CONTAINER_NAME" "startup time:" 60 "$EDITION_TYPE" "$LICENSE_TYPE"; then
+    # Wait for InfluxDB to be ready, with the same timeouts as the binary path
+    if [ "$EDITION_TYPE" = "enterprise" ]; then
+        STARTUP_TIMEOUT="$STARTUP_TIMEOUT_ENTERPRISE"
+    else
+        STARTUP_TIMEOUT="$STARTUP_TIMEOUT_CORE"
+    fi
+    if ! wait_for_container_ready "$CONTAINER_NAME" "startup time:" "$STARTUP_TIMEOUT" "$EDITION_TYPE" "$LICENSE_PROMPTED"; then
         return 1
     fi
 
@@ -1221,7 +1363,7 @@ prompt_storage_configuration() {
 
 # Function to perform health check on server
 perform_server_health_check() {
-    timeout_seconds="${1:-30}"
+    timeout_seconds="${1:-$STARTUP_TIMEOUT_CORE}"
     is_enterprise="${2:-false}"
 
     SUCCESS=0
@@ -1248,38 +1390,29 @@ perform_server_health_check() {
             break
         fi
 
-        # Show email verification message after 10 seconds for Enterprise
-        if [ "$is_enterprise" = "true" ] && [ "$i" -eq 10 ] && [ "$EMAIL_MESSAGE_SHOWN" = "false" ]; then
-            printf "├─${YELLOW} License activation requires email verification${NC}\n"
-            printf "├─${BOLD} → Check your inbox and click the verification link${NC}\n"
+        # Show email verification message after 10 seconds for a new license
+        if [ "$is_enterprise" = "true" ] && [ -n "${LICENSE_TYPE:-}" ] && [ "$i" -eq 10 ] && [ "$EMAIL_MESSAGE_SHOWN" = "false" ]; then
+            print_license_verification_notice
             EMAIL_MESSAGE_SHOWN=true
         fi
 
         # Show progress updates every 15 seconds after initial grace period
-        if [ "$is_enterprise" = "true" ] && [ "$i" -gt 5 ] && [ $((i % 15)) -eq 0 ]; then
-            printf "├─${DIM} Waiting for license verification (%s/%ss)${NC}\n" "$i" "$timeout_seconds"
+        if [ "$is_enterprise" = "true" ] && [ -n "${LICENSE_TYPE:-}" ] && [ "$i" -gt 5 ] && [ $((i % 15)) -eq 0 ]; then
+            print_license_verification_progress "$i" "$timeout_seconds"
         fi
 
         sleep 1
     done
 
     if [ $SUCCESS -eq 0 ]; then
+        print_startup_timeout_error "$timeout_seconds" "$is_enterprise" "${LICENSE_TYPE:-}" "$PORT" "$LOG_FILE"
         if [ "$is_enterprise" = "true" ]; then
-            printf "├─${BOLD} Error: InfluxDB Enterprise failed to start within %s seconds${NC}\n\n" "$timeout_seconds"
-            if [ -n "$LICENSE_TYPE" ]; then
-                printf "   ├─${YELLOW} Check your email for license verification${NC} ${BOLD}(REQUIRED)${NC}\n"
-                printf "   │  ${BOLD}→ Click the verification link in your inbox${NC}\n"
-            fi
-            printf "   ├─ Check for network connectivity issues\n"
-            printf "   └─ Check for port %s conflicts\n" "$PORT"
-
             # Kill the background process if it's still running
             if kill -0 "$PID" 2>/dev/null; then
                 printf "   Stopping background server process...\n"
                 kill "$PID" 2>/dev/null
             fi
         else
-            printf "└─${BOLD} Error: InfluxDB failed to start; check permissions or other potential issues.${NC}\n"
             exit 1
         fi
     fi
@@ -1535,7 +1668,7 @@ if [ "${EDITION}" = "Core" ]; then
         "$INSTALL_LOC/$BINARY_NAME" serve --node-id="$NODE_ID" --http-bind="0.0.0.0:$PORT" $STORAGE_FLAGS >> "$LOG_FILE" 2>&1 &
         PID="$!"
 
-        perform_server_health_check 30
+        perform_server_health_check "$STARTUP_TIMEOUT_CORE"
 
     elif [ "$START_SERVICE" = "y" ] && [ "$STARTUP_CHOICE" = "1" ]; then
         # Quick Start flow - minimal output, just start the server
@@ -1570,7 +1703,7 @@ if [ "${EDITION}" = "Core" ]; then
         "$INSTALL_LOC/$BINARY_NAME" serve --node-id="$NODE_ID" --http-bind="0.0.0.0:$PORT" $STORAGE_FLAGS >> "$LOG_FILE" 2>&1 &
         PID="$!"
 
-        perform_server_health_check 30
+        perform_server_health_check "$STARTUP_TIMEOUT_CORE"
 
     else
         printf "\n"
@@ -1652,7 +1785,7 @@ else
 
         printf "├─${DIM} Server started in background (PID: %s)${NC}\n" "$PID"
 
-        perform_server_health_check 90 true
+        perform_server_health_check "$STARTUP_TIMEOUT_ENTERPRISE" true
 
     elif [ "$START_SERVICE" = "y" ] && [ "$STARTUP_CHOICE" = "2" ]; then
         # Enterprise Custom Start flow
@@ -1739,7 +1872,7 @@ else
 
         printf "├─${DIM} Server started in background (PID: %s)${NC}\n" "$PID"
 
-        perform_server_health_check 90 true
+        perform_server_health_check "$STARTUP_TIMEOUT_ENTERPRISE" true
 
     else
         printf "\n"
