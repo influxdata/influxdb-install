@@ -103,6 +103,7 @@
 #     - Docker not running or unavailable (Docker Compose path)
 #     - Requested version has no Docker image
 #     - Failed image pulls or docker compose commands
+#     - Requested version not found at the release URL (checked before download)
 #     - Failed binary download, signature verification, or extraction
 #     - Invalid SHA256 checksum on downloaded binary
 #     - Container startup timeout (>60 seconds for InfluxDB/Explorer)
@@ -182,7 +183,7 @@ INFLUXDB_VERSION="${INFLUXDB_OSS_VERSION}"
 print_usage() {
     printf "Usage: %s [enterprise] [--version VERSION]\n" "$0"
     printf "  enterprise: Install the Enterprise edition (optional)\n"
-    printf "  --version VERSION: Specify the InfluxDB version (default: %s)\n" "$INFLUXDB_VERSION"
+    printf "  --version VERSION: Specify the InfluxDB version (default: Core %s, Enterprise %s)\n" "$INFLUXDB_OSS_VERSION" "$INFLUXDB_ENT_VERSION"
 }
 
 NEWLINE='
@@ -199,7 +200,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --version)
             if [ $# -lt 2 ] || [ -z "$2" ]; then
-                printf "Error: --version requires a value (e.g. --version %s)\n\n" "$INFLUXDB_VERSION" >&2
+                printf "Error: --version requires a value (e.g. --version %s)\n\n" "$INFLUXDB_OSS_VERSION" >&2
                 print_usage >&2
                 exit 1
             fi
@@ -303,6 +304,48 @@ find_next_available_port() {
     done
 
     echo "$current_port"
+}
+
+# --- Release Availability ---
+
+check_release_url() {
+    release_url="$1"
+    printf "${BOLD}Checking that InfluxDB 3 %s %s is available for %s${NC}\n" "$EDITION" "$INFLUXDB_VERSION" "$ARTIFACT"
+    printf "└─${DIM} curl -sIL --max-time 30 -o /dev/null -w '%%{http_code}' '%s'" "$release_url"
+    http_code=$(curl -sIL --max-time 30 -o /dev/null -w '%{http_code}' "$release_url" 2>/dev/null) || http_code="000"
+    case "$http_code" in
+        200)
+            printf " (OK: HTTP 200)${NC}\n"
+            ;;
+        404)
+            printf " (Error: HTTP 404)${NC}\n"
+            printf "\n${RED}Error:${NC} InfluxDB 3 %s %s was not found for %s.\n" "$EDITION" "$INFLUXDB_VERSION" "$ARTIFACT" >&2
+            printf "No release at '%s'.\n" "$release_url" >&2
+            if [ "${INFLUXDB_VERSION_FLAG_SET}" = "1" ]; then
+                if [ "$EDITION" = "Enterprise" ]; then
+                    default_version="$INFLUXDB_ENT_VERSION"
+                else
+                    default_version="$INFLUXDB_OSS_VERSION"
+                fi
+                printf "Check the version passed with --version, or omit it to install the default (%s).\n" "$default_version" >&2
+            else
+                printf "The default version is not published. Pass --version to choose another release, or check for a newer copy of this script.\n" >&2
+            fi
+            exit 1
+            ;;
+        *)
+            # Only 404 is a definitive answer. Anything else may be a proxy or
+            # CDN rejecting HEAD, so continue and let the download decide.
+            if [ "$http_code" = "000" ]; then
+                status="no response"
+            else
+                status="HTTP $http_code"
+            fi
+            printf " (Warning: %s)${NC}\n" "$status"
+            printf "${YELLOW}Warning:${NC} Could not confirm that '%s' is available (%s).\n" "$release_url" "$status"
+            printf "Continuing; the download will report any problem.\n"
+            ;;
+    esac
 }
 
 # --- Browser Integration ---
@@ -1351,6 +1394,9 @@ if [ -n "$SHELL" ]; then
     fi
 fi
 
+check_release_url "${URL}"
+
+printf "\n"
 printf "${BOLD}Downloading InfluxDB 3 %s to %s${NC}\n" "$EDITION" "$INSTALL_LOC"
 printf "├─${DIM} mkdir -p '%s'${NC}\n" "$INSTALL_LOC"
 mkdir -p "$INSTALL_LOC"
