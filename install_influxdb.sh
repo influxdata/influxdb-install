@@ -108,7 +108,7 @@
 #     - Requested version not found at the release URL (checked before download)
 #     - Failed binary download, signature verification, or extraction
 #     - Invalid SHA256 checksum on downloaded binary
-#     - Container startup timeout (>60 seconds for InfluxDB/Explorer)
+#     - Container startup timeout (30 seconds for Core, 90 for Enterprise, 60 for Explorer)
 #     - Port allocation failure or port range exhausted
 #
 # SPECIAL BEHAVIORS:
@@ -167,6 +167,10 @@ OS=""
 INSTALL_LOC=~/.influxdb
 BINARY_NAME="influxdb3"
 PORT=8181
+
+# Seconds to wait for the server to come up; shared by the binary and Docker paths
+readonly STARTUP_TIMEOUT_CORE=30
+readonly STARTUP_TIMEOUT_ENTERPRISE=90
 
 # Set the default (latest) version here. Users may specify a version using the
 # --version arg (handled below)
@@ -394,6 +398,47 @@ generate_session_secret() {
     fi
 }
 
+# --- Startup Messages ---
+# Shared by perform_server_health_check (binary) and wait_for_container_ready
+# (Docker) so both paths report the same thing while the server comes up.
+
+# Shown once, 10 seconds into startup, when this run requested a new license
+print_license_verification_notice() {
+    printf "├─${YELLOW} License activation requires email verification${NC}\n"
+    printf "├─${BOLD} → Check your inbox and click the verification link${NC}\n"
+}
+
+# Shown every 15 seconds while a new license is pending
+# Parameters:
+#   $1 - seconds waited so far
+#   $2 - timeout in seconds
+print_license_verification_progress() {
+    printf "├─${DIM} Waiting for license verification (%s/%ss)${NC}\n" "$1" "$2"
+}
+
+# Shown when the server has not come up within the timeout
+# Parameters:
+#   $1 - timeout in seconds
+#   $2 - "true" for Enterprise
+#   $3 - non-empty when this run requested a new license
+#   $4 - server port
+#   $5 - where to find the logs (a file path or a docker logs command)
+print_startup_timeout_error() {
+    if [ "$2" = "true" ]; then
+        printf "├─${BOLD} Error: InfluxDB Enterprise failed to start within %s seconds${NC}\n\n" "$1"
+        if [ -n "$3" ]; then
+            printf "   ├─${YELLOW} Check your email for license verification${NC} ${BOLD}(REQUIRED)${NC}\n"
+            printf "   │  ${BOLD}→ Click the verification link in your inbox${NC}\n"
+        fi
+        printf "   ├─ Check for network connectivity issues\n"
+        printf "   ├─ Check for port %s conflicts\n" "$4"
+        printf "   └─ Check the logs: %s\n" "$5"
+    else
+        printf "└─${BOLD} Error: InfluxDB failed to start; check permissions or other potential issues.${NC}\n"
+        printf "   Logs: %s\n" "$5"
+    fi
+}
+
 # ==============================================================================
 # SECTION 5: DOCKER COMPOSE UTILITIES
 # ==============================================================================
@@ -563,55 +608,72 @@ create_docker_directories() {
 
 # --- Health Checks ---
 
-# Utility function to wait for container to be ready
+# Utility function to wait for the InfluxDB container to be ready.
+# Mirrors perform_server_health_check on the binary path: same timeouts,
+# license verification notices, and timeout messages.
 # Parameters:
 #   $1 - container name
 #   $2 - log line that marks the server as ready
-#   $3 - timeout in seconds (default 60)
+#   $3 - timeout in seconds (default STARTUP_TIMEOUT_CORE)
 #   $4 - edition: "core" or "enterprise"
 #   $5 - non-empty when this run requested a new license (shows the email notice)
 wait_for_container_ready() {
     CONTAINER_NAME="$1"
     READY_MESSAGE="$2"
-    TIMEOUT="${3:-60}"
+    TIMEOUT="${3:-$STARTUP_TIMEOUT_CORE}"
     EDITION_TYPE="${4:-}"
     NEW_LICENSE="${5:-}"
+    if [ "$EDITION_TYPE" = "enterprise" ]; then
+        IS_ENTERPRISE=true
+    else
+        IS_ENTERPRISE=false
+    fi
 
+    # Progress dots run until the first license message takes over the line
     printf "├─ Starting InfluxDB"
-    ELAPSED=0
+    DOTS_OPEN=true
     EMAIL_MESSAGE_SHOWN=false
 
-    while [ $ELAPSED -lt $TIMEOUT ]; do
+    for i in $(seq 1 "$TIMEOUT"); do
         if docker logs "$CONTAINER_NAME" 2>&1 | grep -q "$READY_MESSAGE"; then
-            printf "${NC}\n"
+            if [ "$DOTS_OPEN" = "true" ]; then printf "${NC}\n"; fi
             return 0
         fi
 
         if ! docker ps | grep -q "$CONTAINER_NAME"; then
-            printf "${NC}\n"
+            if [ "$DOTS_OPEN" = "true" ]; then printf "${NC}\n"; fi
             printf "├─${RED} Error: InfluxDB container stopped unexpectedly${NC}\n"
             docker logs --tail 20 "$CONTAINER_NAME"
             return 1
         fi
 
-        # Show email verification message after 4 seconds for Enterprise with new license
-        if [ "$EDITION_TYPE" = "enterprise" ] && [ -n "$NEW_LICENSE" ] && \
-           [ $ELAPSED -ge 4 ] && [ "$EMAIL_MESSAGE_SHOWN" = "false" ]; then
+        # Show email verification message after 10 seconds for a new license
+        if [ "$IS_ENTERPRISE" = "true" ] && [ -n "$NEW_LICENSE" ] && [ "$i" -eq 10 ] && [ "$EMAIL_MESSAGE_SHOWN" = "false" ]; then
             printf "${NC}\n"
-            printf "├─${YELLOW} License activation requires email verification${NC}\n"
-            printf "├─${BOLD} → Check your inbox and verify your email address${NC}\n"
-            printf "├─ Continuing startup"
+            DOTS_OPEN=false
+            print_license_verification_notice
             EMAIL_MESSAGE_SHOWN=true
         fi
 
-        printf "."
-        sleep 2
-        ELAPSED=$((ELAPSED + 2))
+        # Show progress updates every 15 seconds after initial grace period
+        if [ "$IS_ENTERPRISE" = "true" ] && [ -n "$NEW_LICENSE" ] && [ "$i" -gt 5 ] && [ $((i % 15)) -eq 0 ]; then
+            print_license_verification_progress "$i" "$TIMEOUT"
+        fi
+
+        if [ "$DOTS_OPEN" = "true" ]; then printf "."; fi
+        sleep 1
     done
 
-    printf "${NC}\n"
-    printf "├─${RED} Error: InfluxDB failed to start within ${TIMEOUT} seconds${NC}\n"
-    docker logs --tail 20 "$CONTAINER_NAME"
+    if [ "$DOTS_OPEN" = "true" ]; then printf "${NC}\n"; fi
+    print_startup_timeout_error "$TIMEOUT" "$IS_ENTERPRISE" "$NEW_LICENSE" "$INFLUXDB_PORT" "docker logs $CONTAINER_NAME"
+
+    # Unlike the binary path, which stops its background process, the container
+    # is left running: once the license is verified it finishes starting on its own
+    if [ -n "$NEW_LICENSE" ] && docker ps | grep -q "$CONTAINER_NAME"; then
+        printf "\n"
+        printf "The %s container is still running and will finish starting once the license is verified.\n" "$CONTAINER_NAME"
+        printf "Re-run this script afterwards to finish setting up the operator token and Explorer.\n"
+    fi
     return 1
 }
 
@@ -985,8 +1047,13 @@ setup_docker_compose() {
 
     docker compose up -d "$CONTAINER_NAME" 2>&1 | filter_docker_output
 
-    # Wait for InfluxDB to be ready
-    if ! wait_for_container_ready "$CONTAINER_NAME" "startup time:" 60 "$EDITION_TYPE" "$LICENSE_PROMPTED"; then
+    # Wait for InfluxDB to be ready, with the same timeouts as the binary path
+    if [ "$EDITION_TYPE" = "enterprise" ]; then
+        STARTUP_TIMEOUT="$STARTUP_TIMEOUT_ENTERPRISE"
+    else
+        STARTUP_TIMEOUT="$STARTUP_TIMEOUT_CORE"
+    fi
+    if ! wait_for_container_ready "$CONTAINER_NAME" "startup time:" "$STARTUP_TIMEOUT" "$EDITION_TYPE" "$LICENSE_PROMPTED"; then
         return 1
     fi
 
@@ -1296,7 +1363,7 @@ prompt_storage_configuration() {
 
 # Function to perform health check on server
 perform_server_health_check() {
-    timeout_seconds="${1:-30}"
+    timeout_seconds="${1:-$STARTUP_TIMEOUT_CORE}"
     is_enterprise="${2:-false}"
 
     SUCCESS=0
@@ -1323,38 +1390,29 @@ perform_server_health_check() {
             break
         fi
 
-        # Show email verification message after 10 seconds for Enterprise
-        if [ "$is_enterprise" = "true" ] && [ "$i" -eq 10 ] && [ "$EMAIL_MESSAGE_SHOWN" = "false" ]; then
-            printf "├─${YELLOW} License activation requires email verification${NC}\n"
-            printf "├─${BOLD} → Check your inbox and click the verification link${NC}\n"
+        # Show email verification message after 10 seconds for a new license
+        if [ "$is_enterprise" = "true" ] && [ -n "${LICENSE_TYPE:-}" ] && [ "$i" -eq 10 ] && [ "$EMAIL_MESSAGE_SHOWN" = "false" ]; then
+            print_license_verification_notice
             EMAIL_MESSAGE_SHOWN=true
         fi
 
         # Show progress updates every 15 seconds after initial grace period
-        if [ "$is_enterprise" = "true" ] && [ "$i" -gt 5 ] && [ $((i % 15)) -eq 0 ]; then
-            printf "├─${DIM} Waiting for license verification (%s/%ss)${NC}\n" "$i" "$timeout_seconds"
+        if [ "$is_enterprise" = "true" ] && [ -n "${LICENSE_TYPE:-}" ] && [ "$i" -gt 5 ] && [ $((i % 15)) -eq 0 ]; then
+            print_license_verification_progress "$i" "$timeout_seconds"
         fi
 
         sleep 1
     done
 
     if [ $SUCCESS -eq 0 ]; then
+        print_startup_timeout_error "$timeout_seconds" "$is_enterprise" "${LICENSE_TYPE:-}" "$PORT" "$LOG_FILE"
         if [ "$is_enterprise" = "true" ]; then
-            printf "├─${BOLD} Error: InfluxDB Enterprise failed to start within %s seconds${NC}\n\n" "$timeout_seconds"
-            if [ -n "$LICENSE_TYPE" ]; then
-                printf "   ├─${YELLOW} Check your email for license verification${NC} ${BOLD}(REQUIRED)${NC}\n"
-                printf "   │  ${BOLD}→ Click the verification link in your inbox${NC}\n"
-            fi
-            printf "   ├─ Check for network connectivity issues\n"
-            printf "   └─ Check for port %s conflicts\n" "$PORT"
-
             # Kill the background process if it's still running
             if kill -0 "$PID" 2>/dev/null; then
                 printf "   Stopping background server process...\n"
                 kill "$PID" 2>/dev/null
             fi
         else
-            printf "└─${BOLD} Error: InfluxDB failed to start; check permissions or other potential issues.${NC}\n"
             exit 1
         fi
     fi
@@ -1610,7 +1668,7 @@ if [ "${EDITION}" = "Core" ]; then
         "$INSTALL_LOC/$BINARY_NAME" serve --node-id="$NODE_ID" --http-bind="0.0.0.0:$PORT" $STORAGE_FLAGS >> "$LOG_FILE" 2>&1 &
         PID="$!"
 
-        perform_server_health_check 30
+        perform_server_health_check "$STARTUP_TIMEOUT_CORE"
 
     elif [ "$START_SERVICE" = "y" ] && [ "$STARTUP_CHOICE" = "1" ]; then
         # Quick Start flow - minimal output, just start the server
@@ -1645,7 +1703,7 @@ if [ "${EDITION}" = "Core" ]; then
         "$INSTALL_LOC/$BINARY_NAME" serve --node-id="$NODE_ID" --http-bind="0.0.0.0:$PORT" $STORAGE_FLAGS >> "$LOG_FILE" 2>&1 &
         PID="$!"
 
-        perform_server_health_check 30
+        perform_server_health_check "$STARTUP_TIMEOUT_CORE"
 
     else
         printf "\n"
@@ -1727,7 +1785,7 @@ else
 
         printf "├─${DIM} Server started in background (PID: %s)${NC}\n" "$PID"
 
-        perform_server_health_check 90 true
+        perform_server_health_check "$STARTUP_TIMEOUT_ENTERPRISE" true
 
     elif [ "$START_SERVICE" = "y" ] && [ "$STARTUP_CHOICE" = "2" ]; then
         # Enterprise Custom Start flow
@@ -1814,7 +1872,7 @@ else
 
         printf "├─${DIM} Server started in background (PID: %s)${NC}\n" "$PID"
 
-        perform_server_health_check 90 true
+        perform_server_health_check "$STARTUP_TIMEOUT_ENTERPRISE" true
 
     else
         printf "\n"
