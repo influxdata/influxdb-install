@@ -287,6 +287,56 @@ DOCKER_IMAGE="influxdb:${INFLUXDB_VERSION}-${EDITION_TAG}"
 
 # --- Port Management ---
 
+# Tool used to check for listeners; empty when none is available
+PORT_PROBE=""
+
+# Pick the tool that checks whether a TCP port has a listener. Tools that read
+# the kernel socket table come first because they see every user's sockets.
+# lsof comes last: as a regular user it cannot see sockets owned by root, such
+# as docker-proxy, so it would report a taken port as free.
+select_port_probe() {
+    if command -v ss >/dev/null 2>&1; then
+        PORT_PROBE="ss"
+    elif command -v netstat >/dev/null 2>&1; then
+        PORT_PROBE="netstat"
+    elif command -v nc >/dev/null 2>&1; then
+        PORT_PROBE="nc"
+    elif command -v lsof >/dev/null 2>&1; then
+        PORT_PROBE="lsof"
+    else
+        PORT_PROBE=""
+    fi
+}
+
+# True when something is listening on TCP port $1
+# The ss and netstat forms match the port at the end of the local address
+# column, which covers 0.0.0.0:8181, [::]:8181, *.8181 and 127.0.0.1.8181.
+port_in_use() {
+    case "$PORT_PROBE" in
+        ss)
+            ss -ltn 2>/dev/null | awk 'NR > 1 {print $4}' | grep -qE "[:.]$1\$"
+            ;;
+        netstat)
+            netstat -an 2>/dev/null | grep -i LISTEN | awk '{print $4}' | grep -qE "[:.]$1\$"
+            ;;
+        nc)
+            nc -z -w 1 127.0.0.1 "$1" >/dev/null 2>&1
+            ;;
+        lsof)
+            lsof -i:"$1" -t >/dev/null 2>&1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# True when the server log says the HTTP port could not be bound
+# Parameters: $1 - log file path
+log_shows_bind_failure() {
+    [ -f "$1" ] && grep -qi "http_bind_failed\|failed to bind address\|address already in use" "$1"
+}
+
 # Find next available port starting from given port
 # Parameters: $1 - starting_port (e.g., 8181)
 # Returns: Available port number (echoes to stdout)
@@ -294,13 +344,14 @@ DOCKER_IMAGE="influxdb:${INFLUXDB_VERSION}-${EDITION_TAG}"
 find_next_available_port() {
     current_port="$1"
 
-    lsof_exec=$(command -v lsof)
-    if [ -z "$lsof_exec" ]; then
+    select_port_probe
+    if [ -z "$PORT_PROBE" ]; then
+        printf "├─${YELLOW} Could not check whether port %s is free: none of ss, netstat, nc or lsof is installed${NC}\n" "$current_port" >&2
         echo "$current_port"
         return 0
     fi
 
-    while "$lsof_exec" -i:"$current_port" -t >/dev/null 2>&1; do
+    while port_in_use "$current_port"; do
         printf "├─${DIM} Port %s is in use. Finding new port.${NC}\n" "$current_port" >&2
         current_port=$((current_port + 1))
         if [ "$current_port" -gt 32767 ]; then
@@ -423,7 +474,14 @@ print_license_verification_progress() {
 #   $3 - non-empty when this run requested a new license
 #   $4 - server port
 #   $5 - where to find the logs (a file path or a docker logs command)
+#   $6 - non-empty when the log shows the port could not be bound
 print_startup_timeout_error() {
+    if [ -n "${6:-}" ]; then
+        printf "├─${BOLD} Error: InfluxDB failed to start because port %s is already in use${NC}\n" "$4"
+        printf "   ├─ Stop the program listening on port %s, then re-run this script\n" "$4"
+        printf "   └─ Check the logs: %s\n" "$5"
+        return 0
+    fi
     if [ "$2" = "true" ]; then
         printf "├─${BOLD} Error: InfluxDB Enterprise failed to start within %s seconds${NC}\n\n" "$1"
         if [ -n "$3" ]; then
@@ -642,8 +700,14 @@ wait_for_container_ready() {
 
         if ! docker ps | grep -q "$CONTAINER_NAME"; then
             if [ "$DOTS_OPEN" = "true" ]; then printf "${NC}\n"; fi
-            printf "├─${RED} Error: InfluxDB container stopped unexpectedly${NC}\n"
-            docker logs --tail 20 "$CONTAINER_NAME"
+            # Docker records a failed port mapping in the container state, not the logs
+            if docker inspect -f '{{.State.Error}}' "$CONTAINER_NAME" 2>/dev/null | grep -qi "port is already allocated\|address already in use"; then
+                printf "├─${RED} Error: port %s is already in use${NC}\n" "$INFLUXDB_PORT"
+                printf "└─ Stop the program listening on port %s, then re-run this script\n" "$INFLUXDB_PORT"
+            else
+                printf "├─${RED} Error: InfluxDB container stopped unexpectedly${NC}\n"
+                docker logs --tail 20 "$CONTAINER_NAME"
+            fi
             return 1
         fi
 
@@ -1370,10 +1434,10 @@ perform_server_health_check() {
     EMAIL_MESSAGE_SHOWN=false
 
     for i in $(seq 1 "$timeout_seconds"); do
-        # on systems without a usable lsof, sleep a second to see if the pid is
+        # when no tool could check the port, sleep a second to see if the pid is
         # still there to give influxdb a chance to error out in case an already
         # running influxdb is running on this port
-        if [ -z "$lsof_exec" ]; then
+        if [ -z "$PORT_PROBE" ]; then
             sleep 1
         fi
 
@@ -1384,7 +1448,11 @@ perform_server_health_check() {
             break
         fi
 
-        if curl --max-time 1 -s "http://localhost:$PORT/health" >/dev/null 2>&1; then
+        # Any program on the port answers the health request, so also require
+        # the server's own startup line in its log, the same marker the Docker
+        # path waits for. Without it a reply from another program on the port
+        # would count as success while this server is dying on a failed bind.
+        if curl --max-time 1 -s "http://localhost:$PORT/health" >/dev/null 2>&1 && grep -q "startup time:" "$LOG_FILE" 2>/dev/null; then
             printf "\n${BOLDGREEN}✓ InfluxDB 3 ${EDITION} is now installed and running on port %s. Nice!${NC}\n" "$PORT"
             SUCCESS=1
             break
@@ -1405,7 +1473,11 @@ perform_server_health_check() {
     done
 
     if [ $SUCCESS -eq 0 ]; then
-        print_startup_timeout_error "$timeout_seconds" "$is_enterprise" "${LICENSE_TYPE:-}" "$PORT" "$LOG_FILE"
+        BIND_FAILED=""
+        if log_shows_bind_failure "$LOG_FILE"; then
+            BIND_FAILED=true
+        fi
+        print_startup_timeout_error "$timeout_seconds" "$is_enterprise" "${LICENSE_TYPE:-}" "$PORT" "$LOG_FILE" "$BIND_FAILED"
         if [ "$is_enterprise" = "true" ]; then
             # Kill the background process if it's still running
             if kill -0 "$PID" 2>/dev/null; then
@@ -1884,8 +1956,14 @@ fi
 printf "\n"
 if [ "${EDITION}" = "Enterprise" ] && [ "$SUCCESS" -eq 0 ] 2>/dev/null; then
     printf "${BOLD}Server startup failed${NC} - troubleshooting options:\n"
-    printf "├─ ${BOLD}${YELLOW}Check email verification:${NC} ${BOLD}Look for verification email and click the link${NC}\n"
-    printf "├─ ${BOLD}   → This is the most common issue for Enterprise activation${NC}\n"
+    if [ -n "${BIND_FAILED:-}" ]; then
+        printf "├─ ${BOLD}${YELLOW}Port %s is already in use:${NC} ${BOLD}Stop the program listening on it, then re-run this script${NC}\n" "$PORT"
+    elif [ -n "${LICENSE_TYPE:-}" ]; then
+        # Only a run that requested a new license can be waiting on email verification
+        printf "├─ ${BOLD}${YELLOW}Check email verification:${NC} ${BOLD}Look for verification email and click the link${NC}\n"
+        printf "├─ ${BOLD}   → This is the most common issue for Enterprise activation${NC}\n"
+    fi
+    printf "├─ ${BOLD}Check the log:${NC} %s\n" "$LOG_FILE"
     printf "├─ ${BOLD}Manual startup:${NC} Try running the server manually to see detailed logs:\n"
     printf "     influxdb3 serve \\\\\n"
     printf "     --cluster-id=%s \\\\\n" "${CLUSTER_ID:-cluster0}"
