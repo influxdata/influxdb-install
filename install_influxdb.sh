@@ -869,8 +869,8 @@ ${CLUSTER_ARG}}
       - --plugin-dir=/var/lib/influxdb3/plugins${ENV_SECTION:+
 ${ENV_SECTION}}
     volumes:
-      - ~/.influxdb/data:/var/lib/influxdb3/data
-      - ~/.influxdb/plugins:/var/lib/influxdb3/plugins
+      - "${HOME}/.influxdb/data:/var/lib/influxdb3/data"
+      - "${HOME}/.influxdb/plugins:/var/lib/influxdb3/plugins"
     restart: unless-stopped
     networks:
       - influxdb-network
