@@ -90,7 +90,8 @@
 #     InfluxDB Port:      Default 8181 (mapped to container 8181)
 #     Explorer Port:      Default 8888 (mapped to container 8080)
 #     Container Restart:  unless-stopped policy
-#     License Type:       (Enterprise only) Passed as INFLUXDB3_ENTERPRISE_LICENSE_TYPE
+#     License Type:       (Enterprise only) Passed as INFLUXDB3_LICENSE_TYPE
+#                         (INFLUXDB3_ENTERPRISE_LICENSE_TYPE before 3.11)
 #                         from .env; omitted when unknown (older .env)
 #
 # EXIT POINTS AND CONDITIONS:
@@ -830,13 +831,19 @@ generate_docker_compose_yaml() {
     if [ "$EDITION_TYPE" = "enterprise" ]; then
         SERVICE_NAME="influxdb3-enterprise"
         CLUSTER_ARG="      - --cluster-id=cluster0"
+        # 3.11 renamed INFLUXDB3_ENTERPRISE_LICENSE_* to INFLUXDB3_LICENSE_*;
+        # 3.11+ warns on the old names and 3.10 and earlier ignore the new ones
+        LICENSE_ENV_PREFIX="INFLUXDB3_LICENSE"
+        if [ "$(printf '%s' "$INFLUXDB_VERSION" | cut -d. -f2)" -lt 11 ]; then
+            LICENSE_ENV_PREFIX="INFLUXDB3_ENTERPRISE_LICENSE"
+        fi
         ENV_SECTION="    environment:
-      - INFLUXDB3_ENTERPRISE_LICENSE_EMAIL=\${INFLUXDB_EMAIL}"
+      - ${LICENSE_ENV_PREFIX}_EMAIL=\${INFLUXDB_EMAIL}"
         # Only when known: the server exits on an empty --license-type, and
         # compose substitutes an empty string for a key missing from .env
         if [ -n "$COMPOSE_LICENSE_TYPE" ]; then
             ENV_SECTION="${ENV_SECTION}
-      - INFLUXDB3_ENTERPRISE_LICENSE_TYPE=\${INFLUXDB_LICENSE_TYPE}"
+      - ${LICENSE_ENV_PREFIX}_TYPE=\${INFLUXDB_LICENSE_TYPE}"
         fi
     else
         SERVICE_NAME="influxdb3-core"
