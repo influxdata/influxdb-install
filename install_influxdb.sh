@@ -13,6 +13,10 @@
 #   1. Docker Compose: Complete stack (InfluxDB + Explorer UI)
 #      - Pins InfluxDB to the version set in this script, or to --version
 #      - Auto-creates docker-compose.yml with proper networking
+#      - Enterprise 3.12.0+ serves the embedded Explorer UI from the InfluxDB
+#        container with user authentication (--mode=all,webui
+#        --user-auth-type=basic); the browser creates the first admin.
+#        Core and older Enterprise run the separate Explorer container.
 #      - Manages Explorer configuration and session secrets
 #      - Supports upgrades of existing Docker installations
 #
@@ -31,10 +35,11 @@
 #   Docker Compose specific:
 #     ~/.influxdb/docker/
 #       ├── docker-compose.yml     (Docker service definitions)
-#       ├── .env                   (License email and type, session secret)
-#       └── explorer/
-#           ├── db/                (Explorer database)
-#           └── config/            (Explorer configuration)
+#       ├── .env                   (License email and type, session secret,
+#       │                           JWT signing key for Enterprise 3.12.0+)
+#       └── explorer/              (Explorer container only; not created for
+#           ├── db/                 Enterprise 3.12.0+, and left in place on
+#           └── config/             upgrade)
 #
 #   Binary specific:
 #     ~/.influxdb/
@@ -60,7 +65,8 @@
 #   Docker Compose:
 #     - Detects existing docker-compose.yml at ~/.influxdb/docker/
 #     - Automatically upgrades in-place when detected
-#     - Reuses the license email and type and the session secret from .env
+#     - Reuses the license email and type, the session secret, and the JWT
+#       signing key from .env, so a re-run does not sign users out
 #     - Pulls the selected version and restarts containers with health checks
 #     - Preserves all data in bind-mounted directories
 #
@@ -87,12 +93,17 @@
 #   Docker Compose Specific:
 #     Port Selection:     Automatic via find_next_available_port()
 #     Session Secret:     64 hex characters from /dev/urandom; reused from .env on re-run
-#     InfluxDB Port:      Default 8181 (mapped to container 8181)
-#     Explorer Port:      Default 8888 (mapped to container 8080)
+#     InfluxDB Port:      Default 8181 (mapped to container 8181); the embedded
+#                         Explorer UI is served on this port
+#     Explorer Port:      Default 8888 (mapped to container 8080); Explorer
+#                         container only
 #     Container Restart:  unless-stopped policy
 #     License Type:       (Enterprise only) Passed as INFLUXDB3_LICENSE_TYPE
 #                         (INFLUXDB3_ENTERPRISE_LICENSE_TYPE before 3.11)
 #                         from .env; omitted when unknown (older .env)
+#     JWT Signing Key:    (Enterprise 3.12.0+) 2048-bit PKCS#1 RSA key, generated
+#                         with the image's openssl, stored as a quoted multi-line
+#                         JWT_PRIVATE_KEY in .env, passed as INFLUXDB3_JWT_PRIVATE_KEY
 #
 # EXIT POINTS AND CONDITIONS:
 #   Successful Exits (exit 0):
@@ -122,13 +133,20 @@
 #
 #   Docker Compose:
 #     - Creates internal network (influxdb-network) for service communication
-#     - Configures Explorer to communicate via container name internally
+#     - Configures the Explorer container to reach InfluxDB by container name
+#     - Embedded UI (Enterprise 3.12.0+): passes --mode=all,webui,
+#       --user-auth-type=basic, and --jwt-key-id=install-script; the session
+#       secret and JWT signing key reach the server through the environment.
+#       The script creates no users and no tokens; the browser's setup page
+#       creates the first admin and shows the operator token once.
 #     - Opens Explorer UI in default browser upon successful startup
 #     - Filters verbose docker compose output for cleaner display
 #
 #   Health Checking:
 #     - InfluxDB (Docker): Waits for "startup time:" in container logs
-#     - Explorer: Polls /api/health endpoint for "ok/status/healthy"
+#     - Explorer container: Polls /api/health endpoint for "ok/status/healthy"
+#     - Embedded UI: One request on / after the InfluxDB check; the result only
+#       selects the summary wording and whether the browser opens
 #
 # SHELL EXECUTION CONTEXT:
 #   - Runs with `sh -e` (error exit on command failure)
@@ -431,6 +449,36 @@ download_file() {
     fi
 }
 
+# --- Version Capabilities ---
+
+# Returns 0 if dotted version $1 is numerically $2 or later
+version_at_least() {
+    have="$1"
+    want="$2"
+    while [ -n "$have" ] || [ -n "$want" ]; do
+        have_field="${have%%.*}"
+        want_field="${want%%.*}"
+        if [ "${have_field:-0}" -gt "${want_field:-0}" ]; then
+            return 0
+        fi
+        if [ "${have_field:-0}" -lt "${want_field:-0}" ]; then
+            return 1
+        fi
+        case "$have" in *.*) have="${have#*.}" ;; *) have="" ;; esac
+        case "$want" in *.*) want="${want#*.}" ;; *) want="" ;; esac
+    done
+    return 0
+}
+
+# Returns 0 if EDITION and INFLUXDB_VERSION serve the embedded Explorer UI
+# with user authentication (Enterprise 3.12.0+). Core has neither.
+has_embedded_ui() {
+    if [ "$EDITION" != "Enterprise" ]; then
+        return 1
+    fi
+    version_at_least "$INFLUXDB_VERSION" "3.12.0"
+}
+
 # --- Browser Integration ---
 
 # Utility function to open URL in browser
@@ -510,6 +558,56 @@ print_startup_timeout_error() {
         printf "└─${BOLD} Error: InfluxDB failed to start; check permissions or other potential issues.${NC}\n"
         printf "   Logs: %s\n" "$5"
     fi
+}
+
+# Exits 0 when $1 looks like a PKCS#1 RSA private key, the only form the
+# server accepts for signing user sign-in tokens (PKCS#8 is rejected)
+is_jwt_private_key() {
+    case "$1" in
+        "-----BEGIN RSA PRIVATE KEY-----"*"-----END RSA PRIVATE KEY-----") return 0 ;;
+    esac
+    return 1
+}
+
+# Prints a 2048-bit PKCS#1 RSA key using "$@" as the openssl command.
+# LibreSSL (macOS /usr/bin/openssl) writes PKCS#1 by default and rejects
+# -traditional; OpenSSL 3 and later write PKCS#8 by default and need it.
+# Returns: 1 when neither form yields a PKCS#1 key
+openssl_pkcs1_key() {
+    GENERATED_KEY=$("$@" genrsa 2048 2>/dev/null) || GENERATED_KEY=""
+    if ! is_jwt_private_key "$GENERATED_KEY"; then
+        GENERATED_KEY=$("$@" genrsa -traditional 2048 2>/dev/null) || GENERATED_KEY=""
+    fi
+    is_jwt_private_key "$GENERATED_KEY" || return 1
+    printf '%s\n' "$GENERATED_KEY"
+}
+
+# Prints a new JWT signing key, trying in order: openssl inside the Docker
+# image $1 (when given, so the host needs nothing), openssl on the host,
+# and ssh-keygen on the host.
+# Parameters:
+#   $1 - Docker image whose openssl to use first, or empty
+# Returns: 1 when no generator is available
+generate_jwt_private_key() {
+    if [ -n "${1:-}" ]; then
+        openssl_pkcs1_key docker run --rm --entrypoint openssl "$1" && return 0
+    fi
+    if command -v openssl >/dev/null 2>&1; then
+        openssl_pkcs1_key openssl && return 0
+    fi
+    if command -v ssh-keygen >/dev/null 2>&1; then
+        KEYGEN_DIR=$(mktemp -d 2>/dev/null) || return 1
+        GENERATED_KEY=""
+        if ssh-keygen -q -m PEM -t rsa -b 2048 -N '' -f "$KEYGEN_DIR/key" </dev/null >/dev/null 2>&1; then
+            GENERATED_KEY=$(cat "$KEYGEN_DIR/key" 2>/dev/null) || GENERATED_KEY=""
+        fi
+        rm -rf "$KEYGEN_DIR"
+        if is_jwt_private_key "$GENERATED_KEY"; then
+            printf '%s\n' "$GENERATED_KEY"
+            return 0
+        fi
+    fi
+    return 1
 }
 
 # ==============================================================================
@@ -664,14 +762,27 @@ filter_docker_output() {
 # --- Filesystem Setup ---
 
 # Utility function to create docker directories with permissions
+# Parameters:
+#   $1 - docker directory
+#   $2 - "true" when the server embeds the Explorer UI, so no Explorer
+#        container runs and its directories are not needed. An existing
+#        explorer/ directory from an older install is left in place.
 create_docker_directories() {
     DOCKER_DIR="$1"
+    EMBEDDED_UI="${2:-false}"
 
     # Create shared data directories (used by both Docker and binary)
     mkdir -p "$HOME/.influxdb/data"
     mkdir -p "$HOME/.influxdb/plugins"
 
-    # Create Docker-specific directories
+    # Compose file and .env live here
+    mkdir -p "$DOCKER_DIR"
+
+    if [ "$EMBEDDED_UI" = "true" ]; then
+        return 0
+    fi
+
+    # Explorer container directories
     mkdir -p "$DOCKER_DIR/explorer/db"
     mkdir -p "$DOCKER_DIR/explorer/config"
 
@@ -751,7 +862,11 @@ wait_for_container_ready() {
     if [ -n "$NEW_LICENSE" ] && docker ps | grep -q "$CONTAINER_NAME"; then
         printf "\n"
         printf "The %s container is still running and will finish starting once the license is verified.\n" "$CONTAINER_NAME"
-        printf "Re-run this script afterwards to finish setting up the operator token and Explorer.\n"
+        if [ "${USE_EMBEDDED_UI:-false}" = true ]; then
+            printf "Re-run this script afterwards to finish setting up Explorer.\n"
+        else
+            printf "Re-run this script afterwards to finish setting up the operator token and Explorer.\n"
+        fi
     fi
     return 1
 }
@@ -833,10 +948,15 @@ create_operator_token() {
 #   $1 - edition: "core" or "enterprise"
 #   $2 - docker directory
 #   $3 - license type ("trial", "home", or empty when unknown; Enterprise only)
+#   $4 - "true" when the server embeds the Explorer UI (Enterprise 3.12.0+).
+#        The server then runs with --mode=all,webui and basic user auth, the
+#        session secret and JWT signing key come from its environment, and
+#        the compose file has no Explorer service.
 generate_docker_compose_yaml() {
     EDITION_TYPE="$1"
     DOCKER_DIR="$2"
     COMPOSE_LICENSE_TYPE="${3:-}"
+    EMBEDDED_UI="${4:-false}"
 
     USER_UID=$(id -u)
     USER_GID=$(id -g)
@@ -844,7 +964,7 @@ generate_docker_compose_yaml() {
     # Determine edition-specific values
     if [ "$EDITION_TYPE" = "enterprise" ]; then
         SERVICE_NAME="influxdb3-enterprise"
-        CLUSTER_ARG="      - --cluster-id=cluster0"
+        EXTRA_ARGS="      - --cluster-id=cluster0"
         # 3.11 renamed INFLUXDB3_ENTERPRISE_LICENSE_* to INFLUXDB3_LICENSE_*;
         # 3.11+ warns on the old names and 3.10 and earlier ignore the new ones
         LICENSE_ENV_PREFIX="INFLUXDB3_LICENSE"
@@ -861,8 +981,48 @@ generate_docker_compose_yaml() {
         fi
     else
         SERVICE_NAME="influxdb3-core"
-        CLUSTER_ARG=""
+        EXTRA_ARGS=""
         ENV_SECTION=""
+    fi
+
+    if [ "$EMBEDDED_UI" = "true" ]; then
+        # `all` does not include `webui`, so both are listed. The secret and
+        # the signing key are passed through the environment so they do not
+        # appear in the container's command line. The key id is any fixed
+        # string; it only labels the key inside issued tokens.
+        if [ -n "$EXTRA_ARGS" ]; then
+            EXTRA_ARGS="${EXTRA_ARGS}
+"
+        fi
+        EXTRA_ARGS="${EXTRA_ARGS}      - --mode=all,webui
+      - --user-auth-type=basic
+      - --jwt-key-id=install-script"
+        if [ -z "$ENV_SECTION" ]; then
+            ENV_SECTION="    environment:"
+        fi
+        ENV_SECTION="${ENV_SECTION}
+      - INFLUXDB3_WEBUI_SESSION_SECRET=\${SESSION_SECRET}
+      - INFLUXDB3_JWT_PRIVATE_KEY=\${JWT_PRIVATE_KEY}"
+        EXPLORER_SERVICE=""
+    else
+        EXPLORER_SERVICE="
+  influxdb3-explorer:
+    image: ${EXPLORER_IMAGE}
+    container_name: influxdb3-explorer
+    command: [\"--mode=admin\"]
+    ports:
+      - \"${EXPLORER_PORT}:8080\"
+    volumes:
+      - ./explorer/db:/db:rw
+      - ./explorer/config:/app-root/config:ro
+    environment:
+      - SESSION_SECRET_KEY=\${SESSION_SECRET}
+    restart: unless-stopped
+    depends_on:
+      - ${SERVICE_NAME}
+    networks:
+      - influxdb-network
+"
     fi
 
     cat > "$DOCKER_DIR/docker-compose.yml" << COMPOSE_EOF
@@ -876,8 +1036,8 @@ services:
     command:
       - influxdb3
       - serve
-      - --node-id=node0${CLUSTER_ARG:+
-${CLUSTER_ARG}}
+      - --node-id=node0${EXTRA_ARGS:+
+${EXTRA_ARGS}}
       - --object-store=file
       - --data-dir=/var/lib/influxdb3/data
       - --plugin-dir=/var/lib/influxdb3/plugins${ENV_SECTION:+
@@ -888,24 +1048,7 @@ ${ENV_SECTION}}
     restart: unless-stopped
     networks:
       - influxdb-network
-
-  influxdb3-explorer:
-    image: ${EXPLORER_IMAGE}
-    container_name: influxdb3-explorer
-    command: ["--mode=admin"]
-    ports:
-      - "${EXPLORER_PORT}:8080"
-    volumes:
-      - ./explorer/db:/db:rw
-      - ./explorer/config:/app-root/config:ro
-    environment:
-      - SESSION_SECRET_KEY=\${SESSION_SECRET}
-    restart: unless-stopped
-    depends_on:
-      - ${SERVICE_NAME}
-    networks:
-      - influxdb-network
-
+${EXPLORER_SERVICE}
 networks:
   influxdb-network:
     driver: bridge
@@ -919,6 +1062,7 @@ COMPOSE_EOF
 #   $3 - license email (Enterprise only)
 #   $4 - docker directory
 #   $5 - license type, or empty when unknown (Enterprise only)
+#   $6 - JWT signing key (PEM), or empty when none is known yet (embedded UI only)
 # Returns: 0 on success, 1 when the file cannot be written
 write_env_file() {
     EDITION_TYPE="$1"
@@ -926,6 +1070,7 @@ write_env_file() {
     LICENSE_EMAIL="$3"
     DOCKER_DIR="$4"
     ENV_LICENSE_TYPE="${5:-}"
+    ENV_JWT_KEY="${6:-}"
 
     ENV_CONTENT="SESSION_SECRET=${SESSION_SECRET}"
     if [ "$EDITION_TYPE" = "enterprise" ]; then
@@ -935,6 +1080,12 @@ ${ENV_CONTENT}"
         fi
         ENV_CONTENT="INFLUXDB_EMAIL=${LICENSE_EMAIL}
 ${ENV_CONTENT}"
+    fi
+    # The PEM spans many lines; compose reads a double-quoted value as one
+    # string. It goes last so single-line readers never meet its lines.
+    if [ -n "$ENV_JWT_KEY" ]; then
+        ENV_CONTENT="${ENV_CONTENT}
+JWT_PRIVATE_KEY=\"${ENV_JWT_KEY}\""
     fi
 
     # umask protects a new file; chmod covers an existing one
@@ -961,6 +1112,24 @@ read_env_value() {
         return 1
     fi
     echo "$VALUE"
+    return 0
+}
+
+# Utility function to read the multi-line JWT_PRIVATE_KEY from the Docker .env file
+# Parameters:
+#   $1 - env file path
+# Returns: 1 when the file or key is missing
+read_env_jwt_private_key() {
+    ENV_FILE="$1"
+
+    if [ ! -f "$ENV_FILE" ]; then
+        return 1
+    fi
+    VALUE=$(sed -n '/^JWT_PRIVATE_KEY="/,/"$/p' "$ENV_FILE" 2>/dev/null | sed -e '1s/^JWT_PRIVATE_KEY="//' -e '$s/"$//')
+    if [ -z "$VALUE" ]; then
+        return 1
+    fi
+    printf '%s\n' "$VALUE"
     return 0
 }
 
@@ -1031,6 +1200,17 @@ setup_docker_compose() {
         SERVER_NAME="InfluxDB 3 Core"
     fi
 
+    # Enterprise 3.12.0+ serves the Explorer UI from the server itself with
+    # user authentication, so no Explorer container runs and no token is
+    # created. Core, and Enterprise below 3.12.0, keep the Explorer container.
+    # The image is pinned to INFLUXDB_VERSION, so the check matches the
+    # version that runs.
+    if has_embedded_ui; then
+        USE_EMBEDDED_UI=true
+    else
+        USE_EMBEDDED_UI=false
+    fi
+
     printf "\n${BOLD}Setting up InfluxDB 3 ${EDITION_NAME}${NC}\n"
 
     # Verify Docker is running before doing any setup work (silent check)
@@ -1081,9 +1261,10 @@ setup_docker_compose() {
     fi
 
     printf "├─ Creating directories\n"
-    create_docker_directories "$DOCKER_DIR"
+    create_docker_directories "$DOCKER_DIR" "$USE_EMBEDDED_UI"
 
-    # Stop any existing containers before reconfiguring
+    # Stop any existing containers before reconfiguring; the old file is
+    # what removes an older layout's Explorer container
     if [ -f "$DOCKER_DIR/docker-compose.yml" ]; then
         printf "├─ Stopping existing containers\n"
         cd "$DOCKER_DIR"
@@ -1094,9 +1275,11 @@ setup_docker_compose() {
         cd - > /dev/null
     fi
 
-    # Check for available ports
+    # Check for available ports. The embedded UI shares the InfluxDB port.
     INFLUXDB_PORT=$(find_next_available_port "$INFLUXDB_PORT")
-    EXPLORER_PORT=$(find_next_available_port "$EXPLORER_PORT")
+    if [ "$USE_EMBEDDED_UI" = false ]; then
+        EXPLORER_PORT=$(find_next_available_port "$EXPLORER_PORT")
+    fi
 
     # Reuse the session secret from a previous run unless it is malformed,
     # so Explorer sessions survive a re-run
@@ -1126,9 +1309,21 @@ setup_docker_compose() {
         esac
     fi
 
+    # Reuse the JWT signing key from a previous run unless it is malformed,
+    # so user sign-ins survive a re-run. A new key is generated after the
+    # image pull, with the openssl inside the image.
+    JWT_PRIVATE_KEY=""
+    if [ "$USE_EMBEDDED_UI" = true ]; then
+        JWT_PRIVATE_KEY=$(read_env_jwt_private_key "$DOCKER_DIR/.env") || JWT_PRIVATE_KEY=""
+        if [ -n "$JWT_PRIVATE_KEY" ] && ! is_jwt_private_key "$JWT_PRIVATE_KEY"; then
+            printf "├─${YELLOW} Warning: JWT_PRIVATE_KEY in %s/.env is not a PKCS#1 RSA key; generating a new one. Users will need to sign in again.${NC}\n" "$DOCKER_DIR"
+            JWT_PRIVATE_KEY=""
+        fi
+    fi
+
     printf "├─ Creating docker-compose.yml (%s)\n" "$DOCKER_IMAGE"
-    generate_docker_compose_yaml "$EDITION_TYPE" "$DOCKER_DIR" "$LICENSE_TYPE"
-    if ! write_env_file "$EDITION_TYPE" "$SESSION_SECRET" "$LICENSE_EMAIL" "$DOCKER_DIR" "$LICENSE_TYPE"; then
+    generate_docker_compose_yaml "$EDITION_TYPE" "$DOCKER_DIR" "$LICENSE_TYPE" "$USE_EMBEDDED_UI"
+    if ! write_env_file "$EDITION_TYPE" "$SESSION_SECRET" "$LICENSE_EMAIL" "$DOCKER_DIR" "$LICENSE_TYPE" "$JWT_PRIVATE_KEY"; then
         printf "└─ ${RED}Error: Could not write %s${NC}\n\n" "$DOCKER_DIR/.env"
         return 1
     fi
@@ -1138,6 +1333,23 @@ setup_docker_compose() {
     # Pull InfluxDB image
     if ! pull_docker_image "$CONTAINER_NAME" "InfluxDB 3 ${EDITION_NAME}" "true"; then
         return 1
+    fi
+
+    # First run with the embedded UI: generate the signing key with the
+    # pulled image's openssl, then write .env again with the key in it
+    if [ "$USE_EMBEDDED_UI" = true ] && [ -z "$JWT_PRIVATE_KEY" ]; then
+        printf "├─ Generating the JWT signing key..."
+        if ! JWT_PRIVATE_KEY=$(generate_jwt_private_key "$DOCKER_IMAGE"); then
+            printf "${RED}FAILED${NC}\n"
+            printf "└─ ${RED}Error: Could not generate an RSA key with openssl in %s, openssl, or ssh-keygen${NC}\n\n" "$DOCKER_IMAGE"
+            return 1
+        fi
+        if ! write_env_file "$EDITION_TYPE" "$SESSION_SECRET" "$LICENSE_EMAIL" "$DOCKER_DIR" "$LICENSE_TYPE" "$JWT_PRIVATE_KEY"; then
+            printf "${RED}FAILED${NC}\n"
+            printf "└─ ${RED}Error: Could not write %s${NC}\n\n" "$DOCKER_DIR/.env"
+            return 1
+        fi
+        printf "SUCCESS\n"
     fi
 
     docker compose up -d "$CONTAINER_NAME" 2>&1 | filter_docker_output
@@ -1150,6 +1362,49 @@ setup_docker_compose() {
     fi
     if ! wait_for_container_ready "$CONTAINER_NAME" "startup time:" "$STARTUP_TIMEOUT" "$EDITION_TYPE" "$LICENSE_PROMPTED"; then
         return 1
+    fi
+
+    if [ "$USE_EMBEDDED_UI" = true ]; then
+        # Smoke check. The server loads the UI before its HTTP listener starts
+        # and serves / without a token, so the UI answers as soon as the
+        # readiness check above does; one request is enough. The result only
+        # selects the summary wording and whether the browser opens. It never
+        # changes the exit status. The browser's setup page creates the first
+        # admin; the script creates no users and no tokens.
+        UI_READY=false
+        printf "└─ Checking InfluxDB 3 Explorer..."
+        if curl -sf --max-time 5 -o /dev/null "http://localhost:${INFLUXDB_PORT}/"; then
+            printf "SUCCESS\n"
+            UI_READY=true
+            open_browser_url "http://localhost:${INFLUXDB_PORT}"
+        else
+            printf "${YELLOW}no response${NC}\n"
+        fi
+
+        if [ "$UI_READY" = true ]; then
+            printf "\n${BOLDGREEN}✓ InfluxDB 3 ${EDITION_NAME} with InfluxDB 3 Explorer successfully deployed${NC}\n\n"
+        else
+            printf "\n${BOLDGREEN}✓ InfluxDB 3 ${EDITION_NAME} successfully deployed${NC}\n\n"
+        fi
+        printf "${BOLD}Access Points:${NC}\n"
+        printf "├─ Explorer UI:  ${BLUE}http://localhost:${INFLUXDB_PORT}${NC}\n"
+        printf "└─ InfluxDB API: ${BLUE}http://localhost:${INFLUXDB_PORT}${NC}\n\n"
+
+        printf "${BOLD}Storage Locations:${NC}\n"
+        printf "├─ InfluxDB Data:    ${DIM}%s/.influxdb/data${NC}\n" "$HOME"
+        printf "└─ InfluxDB Plugins: ${DIM}%s/.influxdb/plugins${NC}\n\n" "$HOME"
+
+        printf "${BOLD}Configuration Files:${NC}\n"
+        printf "├─ Docker Compose:   ${DIM}%s/docker-compose.yml${NC}\n" "$DOCKER_DIR"
+        printf "└─ Secrets:          ${DIM}%s/.env${NC}\n\n" "$DOCKER_DIR"
+
+        printf "${BOLD}Open Explorer UI:${NC} ${BLUE}http://localhost:${INFLUXDB_PORT}${NC}\n"
+        if [ "$UI_READY" = false ]; then
+            printf "${DIM}If the page does not load, check: docker logs %s${NC}\n" "$CONTAINER_NAME"
+        fi
+        printf "\n"
+
+        return 0
     fi
 
     # Check for existing token in Explorer config, or create new one
