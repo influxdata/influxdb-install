@@ -1039,6 +1039,7 @@ generate_docker_compose_yaml() {
   influxdb3-explorer:
     image: ${EXPLORER_IMAGE}
     container_name: influxdb3-explorer
+    user: \"${USER_UID}:${USER_GID}\"
     command: [\"--mode=admin\"]
     ports:
       - \"${EXPLORER_PORT}:8080\"
@@ -1527,11 +1528,19 @@ setup_docker_compose() {
     # Show manual setup instructions if Explorer was not deployed
     if [ "$EXPLORER_DEPLOYED" = false ]; then
         printf "${BOLD}To Complete InfluxDB 3 Explorer Setup:${NC}\n"
-        printf "1. Replace ${DIM}\"YOUR_TOKEN_HERE\"${NC} with your admin token in the Explorer config file:\n"
-        printf "   ${DIM}%s/explorer/config/config.json${NC}\n\n" "$DOCKER_DIR"
-        printf "2. Start InfluxDB 3 Explorer:\n"
-        printf "   ${DIM}cd %s && docker compose up -d influxdb3-explorer${NC}\n\n" "$DOCKER_DIR"
-        printf "3. Open your browser to http://localhost:${EXPLORER_PORT}\n\n"
+        if [ "$TOKEN" != "$MANUAL_TOKEN_MSG" ] && [ "$TOKEN" != "TOKEN_ALREADY_EXISTS" ]; then
+            # The token is already in the config; Explorer was started but did not answer in time
+            printf "Explorer did not respond within 60 seconds. It may still be starting.\n"
+            printf "1. Check its status and logs:\n"
+            printf "   ${DIM}cd %s && docker compose ps influxdb3-explorer && docker compose logs influxdb3-explorer${NC}\n\n" "$DOCKER_DIR"
+            printf "2. Open your browser to http://localhost:${EXPLORER_PORT}\n\n"
+        else
+            printf "1. Replace ${DIM}\"YOUR_TOKEN_HERE\"${NC} with your admin token in the Explorer config file:\n"
+            printf "   ${DIM}%s/explorer/config/config.json${NC}\n\n" "$DOCKER_DIR"
+            printf "2. Start InfluxDB 3 Explorer:\n"
+            printf "   ${DIM}cd %s && docker compose up -d influxdb3-explorer${NC}\n\n" "$DOCKER_DIR"
+            printf "3. Open your browser to http://localhost:${EXPLORER_PORT}\n\n"
+        fi
     fi
 
     return 0
