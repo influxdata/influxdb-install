@@ -288,7 +288,9 @@ DOCKER_IMAGE="influxdb:${INFLUXDB_VERSION}-${EDITION_TAG}"
 
 # --- Port Management ---
 
-# Tool used to check for listeners; empty when none is available
+# Tool used to check for listeners; empty when none is available.
+# Set once by select_port_probe below, in the main shell, so every caller sees
+# the same value.
 PORT_PROBE=""
 
 # Pick the tool that checks whether a TCP port has a listener. Tools that read
@@ -332,6 +334,11 @@ port_in_use() {
     esac
 }
 
+# Select the probe once at the top level. find_next_available_port runs inside
+# $(...), so a selection made there would be lost with that subshell and the
+# health check would always see an empty PORT_PROBE.
+select_port_probe
+
 # True when the server log says the HTTP port could not be bound
 # Parameters: $1 - log file path
 log_shows_bind_failure() {
@@ -345,7 +352,6 @@ log_shows_bind_failure() {
 find_next_available_port() {
     current_port="$1"
 
-    select_port_probe
     if [ -z "$PORT_PROBE" ]; then
         printf "├─${YELLOW} Could not check whether port %s is free: none of ss, netstat, nc or lsof is installed${NC}\n" "$current_port" >&2
         echo "$current_port"
