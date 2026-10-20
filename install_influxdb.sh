@@ -15,8 +15,9 @@
 #      - Auto-creates docker-compose.yml with proper networking
 #      - Enterprise 3.12.0+ serves the embedded Explorer UI from the InfluxDB
 #        container with user authentication (--mode=all,webui
-#        --user-auth-type=basic); the browser creates the first admin.
-#        Core and older Enterprise run the separate Explorer container.
+#        --user-auth-type=basic); on a new server the browser creates the
+#        first admin. Core and older Enterprise run the separate Explorer
+#        container.
 #      - Manages Explorer configuration and session secrets
 #      - Supports upgrades of existing Docker installations
 #
@@ -79,6 +80,7 @@
 #       signing key from .env, so a re-run does not sign users out
 #     - Pulls the selected version and restarts containers with health checks
 #     - Preserves all data in bind-mounted directories
+#     - Reads the old edition and image version from docker-compose.yml
 #
 #   Binary:
 #     - Overwrites any existing binary at ~/.influxdb/influxdb3
@@ -166,8 +168,13 @@
 #     - Embedded UI (Enterprise 3.12.0+): passes --mode=all,webui,
 #       --user-auth-type=basic, and --jwt-key-id=install-script; the session
 #       secret and JWT signing key reach the server through the environment.
-#       The script creates no users and no tokens; the browser's setup page
-#       creates the first admin and shows the operator token once.
+#       The script creates no users and no tokens; on a new server the
+#       browser's setup page creates the first admin and shows the operator
+#       token once.
+#     - Upgrade from Core or Enterprise below 3.12.0: the old layout's
+#       operator token skips the setup page, so the summary shows the
+#       "docker exec ... influxdb3 create user" command instead of opening
+#       the browser; the token stays in explorer/config/config.json
 #     - Opens Explorer UI in default browser upon successful startup
 #     - Filters verbose docker compose output for cleaner display
 #
@@ -1446,7 +1453,9 @@ setup_docker_compose() {
         if curl -sf --max-time 5 -o /dev/null "http://localhost:${INFLUXDB_PORT}/"; then
             printf "SUCCESS\n"
             UI_READY=true
-            open_browser_url "http://localhost:${INFLUXDB_PORT}"
+            if ! predates_embedded_ui "$INSTALLED_EDITION" "$INSTALLED_VERSION"; then
+                open_browser_url "http://localhost:${INFLUXDB_PORT}"
+            fi
         else
             printf "${YELLOW}no response${NC}\n"
         fi
@@ -1468,9 +1477,27 @@ setup_docker_compose() {
         printf "├─ Docker Compose:   ${DIM}%s/docker-compose.yml${NC}\n" "$DOCKER_DIR"
         printf "└─ Secrets:          ${DIM}%s/.env${NC}\n\n" "$DOCKER_DIR"
 
-        printf "${BOLD}Open Explorer UI:${NC} ${BLUE}http://localhost:${INFLUXDB_PORT}${NC}\n"
+        if predates_embedded_ui "$INSTALLED_EDITION" "$INSTALLED_VERSION"; then
+            printf "${BOLD}Explorer UI:${NC} create the first user, then sign in (steps below)\n"
+        else
+            printf "${BOLD}Open Explorer UI:${NC} ${BLUE}http://localhost:${INFLUXDB_PORT}${NC}\n"
+        fi
         if [ "$UI_READY" = false ]; then
             printf "${DIM}If the page does not load, check: docker logs %s${NC}\n" "$CONTAINER_NAME"
+        fi
+
+        # The old layout's operator token skips the setup page; the upgrade
+        # leaves it in the old Explorer config
+        if predates_embedded_ui "$INSTALLED_EDITION" "$INSTALLED_VERSION"; then
+            if extract_token_from_explorer_config "$DOCKER_DIR" >/dev/null; then
+                TOKEN_HINT="The operator token from the earlier install is DEFAULT_API_TOKEN in $DOCKER_DIR/explorer/config/config.json"
+            else
+                TOKEN_HINT="Use the operator token shown when the earlier install created it."
+            fi
+            display_first_user_instructions \
+                "docker exec -it $CONTAINER_NAME influxdb3 create user --token <operator token> --username <name> --password <password> --role Admin" \
+                "http://localhost:${INFLUXDB_PORT}" \
+                "$TOKEN_HINT"
         fi
         printf "\n"
 
@@ -2030,6 +2057,9 @@ if [ -f "$HOME/.influxdb/docker/docker-compose.yml" ]; then
     elif grep -q "influxdb3-core:" "$HOME/.influxdb/docker/docker-compose.yml" 2>/dev/null; then
         INSTALLED_EDITION="Core"
     fi
+    # "image: influxdb:3.11.0-enterprise"; a floating "influxdb:3-enterprise"
+    # tag yields "3", which counts as below 3.12.0
+    INSTALLED_VERSION=$(grep -oE 'image: *influxdb:[0-9.]+' "$HOME/.influxdb/docker/docker-compose.yml" 2>/dev/null | head -n1 | sed 's/.*influxdb://') || INSTALLED_VERSION=""
 elif [ -f "$HOME/.influxdb/influxdb3" ]; then
     # "influxdb3 InfluxDB 3 Enterprise, 3.11.0, revision ..."; read before
     # the download overwrites the binary
