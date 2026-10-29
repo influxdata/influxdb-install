@@ -176,8 +176,8 @@ readonly STARTUP_TIMEOUT_ENTERPRISE=90
 # Set the default (latest) version here. Users may specify a version using the
 # --version arg (handled below)
 INFLUXDB_VERSION_FLAG_SET="0"
-INFLUXDB_OSS_VERSION="3.12.1"
-INFLUXDB_ENT_VERSION=3.12.1
+INFLUXDB_OSS_VERSION="3.12.2"
+INFLUXDB_ENT_VERSION=3.12.2
 
 EDITION="Core"
 EDITION_TAG="core"
