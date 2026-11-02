@@ -456,10 +456,14 @@ is_session_secret() {
     return 0
 }
 
-# Prints 32 random bytes as 64 hex characters
+# Prints the SHA256 of 32 random bytes as 64 hex characters
 # Returns: 1 when generation fails (sh -e ignores a failed pipeline stage)
 generate_session_secret() {
-    GENERATED_SECRET=$(head -c 32 /dev/urandom | od -An -v -tx1 | tr -d ' \n')
+    if [ "${OS}" = "Darwin" ]; then
+        GENERATED_SECRET=$(head -c 32 /dev/urandom | shasum -a 256 | cut -d ' ' -f 1)
+    else
+        GENERATED_SECRET=$(head -c 32 /dev/urandom | sha256sum | cut -d ' ' -f 1)
+    fi
     is_session_secret "$GENERATED_SECRET" || return 1
     printf '%s\n' "$GENERATED_SECRET"
 }
@@ -1159,7 +1163,9 @@ setup_docker_compose() {
 
     if [ -f "$CONFIG_FILE" ]; then
         printf "└─ Found existing Explorer config\n\n"
-        TOKEN=$(extract_token_from_explorer_config "$DOCKER_DIR")
+        # The helper returns 1 when there is no usable token; guard it so -e
+        # does not stop the script before Explorer is launched
+        TOKEN=$(extract_token_from_explorer_config "$DOCKER_DIR") || TOKEN=""
 
         if [ -n "$TOKEN" ]; then
             TOKEN_IS_NEW=false
