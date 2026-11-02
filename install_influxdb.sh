@@ -25,6 +25,9 @@
 #      - Extracts to user home directory (~/.influxdb)
 #      - Auto-configures shell PATH environment
 #      - Offers Quick Start, Custom, or Install-Only modes
+#      - Enterprise 3.12.0+ starts with the embedded Explorer UI and user
+#        authentication (--mode=all,webui --user-auth-type=basic); the
+#        session secret and JWT signing key live under ~/.influxdb
 #
 # DIRECTORY STRUCTURE:
 #   Shared data directory (both installation methods):
@@ -44,7 +47,12 @@
 #   Binary specific:
 #     ~/.influxdb/
 #       ├── influxdb3              (Main binary)
-#       └── logs/                  (Timestamped server logs)
+#       ├── logs/                  (Timestamped server logs)
+#       ├── webui-session-secret   (Enterprise 3.12.0+: embedded Explorer UI
+#       │                           session secret, mode 600, reused on re-run)
+#       └── jwt-private-key.pem    (Enterprise 3.12.0+: PKCS#1 RSA key that
+#                                   signs user sign-in tokens, mode 600,
+#                                   reused on re-run)
 #
 # REQUIREMENTS/PREREQUISITES:
 #   Core Requirements:
@@ -60,6 +68,8 @@
 #   Binary Method:
 #     - Supported OS: macOS (ARM64 only), Linux (x86_64 or ARM64)
 #     - Port availability (default 8181, auto-adjusts if in use)
+#     - openssl or ssh-keygen (Enterprise 3.12.0+, to generate the JWT
+#       signing key on the first run)
 #
 # EXISTING INSTALLATION HANDLING:
 #   Docker Compose:
@@ -74,6 +84,8 @@
 #     - Overwrites any existing binary at ~/.influxdb/influxdb3
 #     - Preserves data directory (~/.influxdb/data) automatically
 #     - User can run script repeatedly to upgrade to latest version
+#     - Reuses the Explorer session secret and JWT signing key, so a re-run
+#       does not sign users out
 #
 # CONFIGURATION OPTIONS:
 #   Command Line Arguments:
@@ -131,6 +143,17 @@
 #     - Validates checksums before extraction
 #     - Automatically adds installation path to shell rc file
 #
+#   Binary Embedded UI (Enterprise 3.12.0+):
+#     - Every startup choice, including Skip, loads or creates the session
+#       secret and the JWT signing key so the displayed serve command is real
+#     - A malformed secret or key file is replaced with a warning; a failed
+#       generation stops the script
+#     - Both reach the server through INFLUXDB3_WEBUI_SESSION_SECRET and
+#       INFLUXDB3_JWT_PRIVATE_KEY, not flags, so they are absent from the
+#       process list; displayed commands show them as "$(cat <file>)"
+#     - The script creates no users and no tokens; the browser's setup page
+#       creates the first admin and shows the operator token once
+#
 #   Docker Compose:
 #     - Creates internal network (influxdb-network) for service communication
 #     - Configures the Explorer container to reach InfluxDB by container name
@@ -144,6 +167,9 @@
 #
 #   Health Checking:
 #     - InfluxDB (Docker): Waits for "startup time:" in container logs
+#     - InfluxDB (Binary): Polls /health until it answers; any HTTP response,
+#       including 401 when the server requires auth, means the listener is
+#       up, and the UI is loaded before the listener starts
 #     - Explorer container: Polls /api/health endpoint for "ok/status/healthy"
 #     - Embedded UI: One request on / after the InfluxDB check; the result only
 #       selects the summary wording and whether the browser opens
@@ -186,6 +212,10 @@ OS=""
 INSTALL_LOC=~/.influxdb
 BINARY_NAME="influxdb3"
 PORT=8181
+# Script-owned secret files for the embedded Explorer UI with user auth
+# (Enterprise 3.12.0+ binary), mode 600, reused on every run
+WEBUI_SECRET_FILE="$INSTALL_LOC/webui-session-secret"
+JWT_KEY_FILE="$INSTALL_LOC/jwt-private-key.pem"
 
 # Seconds to wait for the server to come up; shared by the binary and Docker paths
 readonly STARTUP_TIMEOUT_CORE=30
@@ -1783,12 +1813,19 @@ display_enterprise_server_command() {
     if [ "$is_quick_start" = "true" ]; then
         # Quick Start format
         printf "└─${DIM} Command: ${NC}\n"
+        if [ "$USE_EMBEDDED_UI" = true ]; then
+            printf "${DIM}   INFLUXDB3_WEBUI_SESSION_SECRET=\"\$(cat '%s')\" \\\\${NC}\n" "$WEBUI_SECRET_FILE"
+            printf "${DIM}   INFLUXDB3_JWT_PRIVATE_KEY=\"\$(cat '%s')\" \\\\${NC}\n" "$JWT_KEY_FILE"
+        fi
         printf "${DIM}   influxdb3 serve \\\\${NC}\n"
         printf "${DIM}   --cluster-id=%s \\\\${NC}\n" "$CLUSTER_ID"
         printf "${DIM}   --node-id=%s \\\\${NC}\n" "$NODE_ID"
         if [ -n "$LICENSE_TYPE" ] && [ -n "$LICENSE_EMAIL" ]; then
             printf "${DIM}   --license-type=%s \\\\${NC}\n" "$LICENSE_TYPE"
             printf "${DIM}   --license-email=%s \\\\${NC}\n" "$LICENSE_EMAIL"
+        fi
+        if [ "$USE_EMBEDDED_UI" = true ]; then
+            printf "${DIM}   --mode=all,webui --user-auth-type=basic --jwt-key-id=install-script \\\\${NC}\n"
         fi
         printf "${DIM}   --http-bind=0.0.0.0:%s \\\\${NC}\n" "$PORT"
         printf "${DIM}   %s${NC}\n" "$STORAGE_FLAGS_ECHO"
@@ -1797,14 +1834,127 @@ display_enterprise_server_command() {
         # Custom configuration format
         printf "│\n"
         printf "├─ Running serve command:\n"
+        if [ "$USE_EMBEDDED_UI" = true ]; then
+            printf "├─${DIM} INFLUXDB3_WEBUI_SESSION_SECRET=\"\$(cat '%s')\" \\\\${NC}\n" "$WEBUI_SECRET_FILE"
+            printf "├─${DIM} INFLUXDB3_JWT_PRIVATE_KEY=\"\$(cat '%s')\" \\\\${NC}\n" "$JWT_KEY_FILE"
+        fi
         printf "├─${DIM} influxdb3 serve \\\\${NC}\n"
         printf "├─${DIM} --cluster-id='%s' \\\\${NC}\n" "$CLUSTER_ID"
         printf "├─${DIM} --node-id='%s' \\\\${NC}\n" "$NODE_ID"
         printf "├─${DIM} --license-type='%s' \\\\${NC}\n" "$LICENSE_TYPE"
         printf "├─${DIM} --license-email='%s' \\\\${NC}\n" "$LICENSE_EMAIL"
+        if [ "$USE_EMBEDDED_UI" = true ]; then
+            printf "├─${DIM} --mode='all,webui' --user-auth-type='basic' --jwt-key-id='install-script' \\\\${NC}\n"
+        fi
         printf "├─${DIM} --http-bind='0.0.0.0:%s' \\\\${NC}\n" "$PORT"
         printf "├─${DIM} %s${NC}\n" "$STORAGE_FLAGS_ECHO"
         printf "│\n"
+    fi
+}
+
+# Function to display the Enterprise serve command for a manual start, with
+# defaults for anything the user has not chosen yet (troubleshooting after a
+# failed startup, and Skip startup)
+display_enterprise_manual_command() {
+    if [ "$USE_EMBEDDED_UI" = true ]; then
+        printf "     INFLUXDB3_WEBUI_SESSION_SECRET=\"\$(cat '%s')\" \\\\\n" "$WEBUI_SECRET_FILE"
+        printf "     INFLUXDB3_JWT_PRIVATE_KEY=\"\$(cat '%s')\" \\\\\n" "$JWT_KEY_FILE"
+    fi
+    printf "     influxdb3 serve \\\\\n"
+    printf "     --cluster-id=%s \\\\\n" "${CLUSTER_ID:-cluster0}"
+    printf "     --node-id=%s \\\\\n" "${NODE_ID:-node0}"
+    printf "     --license-type=%s \\\\\n" "${LICENSE_TYPE:-trial}"
+    printf "     --license-email=%s \\\\\n" "${LICENSE_EMAIL:-your@email.com}"
+    if [ "$USE_EMBEDDED_UI" = true ]; then
+        printf "     --mode=all,webui --user-auth-type=basic --jwt-key-id=install-script \\\\\n"
+    fi
+    printf "     --http-bind=0.0.0.0:%s \\\\\n" "$PORT"
+    printf "     %s\n" "${STORAGE_FLAGS_ECHO:-"--object-store=file --data-dir $INSTALL_LOC/data --plugin-dir $INSTALL_LOC/plugins"}"
+}
+
+# --- Embedded Explorer UI with user auth (Enterprise 3.12.0+) ---
+
+# Write $2 to $1 as a file readable only by its owner
+# Returns: 1 when the file cannot be written
+write_private_file() {
+    # umask protects a new file; chmod covers an existing one
+    (
+        umask 077
+        printf '%s\n' "$2" > "$1"
+    ) && chmod 600 "$1"
+}
+
+# Load the embedded UI session secret from the script-owned file, creating
+# the file when it is missing, and export the secret for the server launch.
+# The server requires a secret whenever webui is on. It is passed through the
+# environment, not a flag, so it does not appear in the process list, and it
+# is reused on every run so that a re-run does not sign browsers out.
+# Exits: 1 when the secret cannot be generated or the file cannot be written
+load_webui_session_secret() {
+    WEBUI_SESSION_SECRET=""
+    if [ -f "$WEBUI_SECRET_FILE" ]; then
+        WEBUI_SESSION_SECRET=$(cat "$WEBUI_SECRET_FILE" 2>/dev/null) || WEBUI_SESSION_SECRET=""
+    fi
+    # A malformed file (failed write, hand edit) is replaced
+    if ! is_session_secret "$WEBUI_SESSION_SECRET"; then
+        if [ -n "$WEBUI_SESSION_SECRET" ]; then
+            printf "\n${YELLOW}Warning: '%s' does not hold a usable session secret; generating a new one. Browsers signed in to Explorer will need to sign in again.${NC}\n" "$WEBUI_SECRET_FILE" >&2
+        fi
+        if ! WEBUI_SESSION_SECRET=$(generate_session_secret); then
+            printf "\n${RED}Error:${NC} Could not generate the Explorer session secret from /dev/urandom.\n" >&2
+            exit 1
+        fi
+        if ! write_private_file "$WEBUI_SECRET_FILE" "$WEBUI_SESSION_SECRET"; then
+            printf "\n${RED}Error:${NC} Could not write the Explorer session secret to '%s'.\n" "$WEBUI_SECRET_FILE" >&2
+            exit 1
+        fi
+    fi
+    export INFLUXDB3_WEBUI_SESSION_SECRET="$WEBUI_SESSION_SECRET"
+}
+
+# Load the JWT signing key from the script-owned file, creating the file when
+# it is missing, and export the key for the server launch. The server signs
+# user sign-in tokens with it and accepts only a PKCS#1 RSA key; a bad key
+# does not stop the server, it only disables sign-in. The key is passed
+# through the environment, not a flag, and reused on every run so that a
+# re-run does not sign users out.
+# Exits: 1 when no key can be generated or the file cannot be written
+load_jwt_private_key() {
+    JWT_PRIVATE_KEY=""
+    if [ -f "$JWT_KEY_FILE" ]; then
+        JWT_PRIVATE_KEY=$(cat "$JWT_KEY_FILE" 2>/dev/null) || JWT_PRIVATE_KEY=""
+    fi
+    # A malformed file (PKCS#8, truncated, hand edit) is replaced
+    if ! is_jwt_private_key "$JWT_PRIVATE_KEY"; then
+        if [ -n "$JWT_PRIVATE_KEY" ]; then
+            printf "\n${YELLOW}Warning: '%s' is not a PKCS#1 RSA private key; generating a new one. Users will need to sign in again.${NC}\n" "$JWT_KEY_FILE" >&2
+        fi
+        if ! JWT_PRIVATE_KEY=$(generate_jwt_private_key ""); then
+            printf "\n${RED}Error:${NC} Could not generate the JWT signing key. Install openssl or ssh-keygen and run this script again.\n" >&2
+            exit 1
+        fi
+        if ! write_private_file "$JWT_KEY_FILE" "$JWT_PRIVATE_KEY"; then
+            printf "\n${RED}Error:${NC} Could not write the JWT signing key to '%s'.\n" "$JWT_KEY_FILE" >&2
+            exit 1
+        fi
+    fi
+    export INFLUXDB3_JWT_PRIVATE_KEY="$JWT_PRIVATE_KEY"
+}
+
+# Smoke check for the embedded UI. The server loads the UI before its HTTP
+# listener starts and serves / without a token, so the UI answers as soon as
+# /health does; one request is enough. The result only selects the summary
+# wording and whether the browser opens. It never changes the exit status.
+# Sets: UI_READY
+check_embedded_ui() {
+    UI_READY=false
+    printf "\n${BOLD}Checking InfluxDB 3 Explorer${NC}\n"
+    if curl -sf --max-time 5 -o /dev/null "http://localhost:${PORT}/"; then
+        printf "└─ Explorer is served by InfluxDB on port %s\n" "$PORT"
+        UI_READY=true
+        open_browser_url "http://localhost:${PORT}"
+    else
+        printf "└─ ${YELLOW}Explorer did not respond at http://localhost:%s/${NC}\n" "$PORT"
     fi
 }
 
@@ -1961,6 +2111,21 @@ fi
 
 export INFLUXDB3_SERVE_INVOCATION_METHOD="install-script"
 
+# Enterprise 3.12.0+ serves the Explorer UI from the server with user
+# authentication. Every startup choice, including Skip, loads or creates the
+# session secret and the JWT signing key so that the displayed serve command
+# is real. The browser's setup page creates the first admin; the script
+# creates no users and no tokens. Core and older Enterprise are unchanged.
+USE_EMBEDDED_UI=false
+UI_FLAGS=""
+UI_READY=false
+if has_embedded_ui; then
+    USE_EMBEDDED_UI=true
+    UI_FLAGS="--mode=all,webui --user-auth-type=basic --jwt-key-id=install-script"
+    load_webui_session_secret
+    load_jwt_private_key
+fi
+
 if [ "${EDITION}" = "Core" ]; then
     # Prompt user for startup options
     printf "\n"
@@ -2113,6 +2278,9 @@ else
         fi
         printf "├─${DIM} Storage: %s/data${NC}\n" "${INSTALL_LOC}"
         printf "├─${DIM} Plugins: %s/plugins${NC}\n" "${INSTALL_LOC}"
+        if [ "$USE_EMBEDDED_UI" = true ]; then
+            printf "├─${DIM} Explorer UI: embedded, user auth (secrets in %s and %s)${NC}\n" "$WEBUI_SECRET_FILE" "$JWT_KEY_FILE"
+        fi
 
         # Create logs directory and generate timestamped log filename
         mkdir -p "$INSTALL_LOC/logs"
@@ -2131,13 +2299,15 @@ else
         # Show the command being executed
         display_enterprise_server_command true
 
-        # Start server in background with or without license flags
+        # Start server in background with or without license flags. The
+        # session secret and signing key, when the UI is on, are already
+        # exported.
         if [ -n "$LICENSE_TYPE" ] && [ -n "$LICENSE_EMAIL" ]; then
             # New license needed
-            "$INSTALL_LOC/$BINARY_NAME" serve --cluster-id="$CLUSTER_ID" --node-id="$NODE_ID" --license-type="$LICENSE_TYPE" --license-email="$LICENSE_EMAIL" --http-bind="0.0.0.0:$PORT" $STORAGE_FLAGS >> "$LOG_FILE" 2>&1 &
+            "$INSTALL_LOC/$BINARY_NAME" serve --cluster-id="$CLUSTER_ID" --node-id="$NODE_ID" --license-type="$LICENSE_TYPE" --license-email="$LICENSE_EMAIL" $UI_FLAGS --http-bind="0.0.0.0:$PORT" $STORAGE_FLAGS >> "$LOG_FILE" 2>&1 &
         else
             # Existing license file
-            "$INSTALL_LOC/$BINARY_NAME" serve --cluster-id="$CLUSTER_ID" --node-id="$NODE_ID" --http-bind="0.0.0.0:$PORT" $STORAGE_FLAGS >> "$LOG_FILE" 2>&1 &
+            "$INSTALL_LOC/$BINARY_NAME" serve --cluster-id="$CLUSTER_ID" --node-id="$NODE_ID" $UI_FLAGS --http-bind="0.0.0.0:$PORT" $STORAGE_FLAGS >> "$LOG_FILE" 2>&1 &
         fi
         PID="$!"
 
@@ -2216,6 +2386,9 @@ else
         printf "├─${DIM} License Type: %s${NC}\n" "$LICENSE_DESC"
         printf "├─${DIM} Email: %s${NC}\n" "$LICENSE_EMAIL"
         printf "├─${DIM} Storage: %s${NC}\n" "$STORAGE_TYPE"
+        if [ "$USE_EMBEDDED_UI" = true ]; then
+            printf "├─${DIM} Explorer UI: embedded, user auth (secrets in %s and %s)${NC}\n" "$WEBUI_SECRET_FILE" "$JWT_KEY_FILE"
+        fi
 
         # Create logs directory and generate timestamped log filename
         mkdir -p "$INSTALL_LOC/logs"
@@ -2224,8 +2397,9 @@ else
 
         display_enterprise_server_command false
 
-        # Start server in background
-        "$INSTALL_LOC/$BINARY_NAME" serve --cluster-id="$CLUSTER_ID" --node-id="$NODE_ID" --license-type="$LICENSE_TYPE" --license-email="$LICENSE_EMAIL" --http-bind="0.0.0.0:$PORT" $STORAGE_FLAGS >> "$LOG_FILE" 2>&1 &
+        # Start server in background; the session secret and signing key,
+        # when the UI is on, are already exported
+        "$INSTALL_LOC/$BINARY_NAME" serve --cluster-id="$CLUSTER_ID" --node-id="$NODE_ID" --license-type="$LICENSE_TYPE" --license-email="$LICENSE_EMAIL" $UI_FLAGS --http-bind="0.0.0.0:$PORT" $STORAGE_FLAGS >> "$LOG_FILE" 2>&1 &
         PID="$!"
 
         printf "├─${DIM} Server started in background (PID: %s)${NC}\n" "$PID"
@@ -2235,6 +2409,12 @@ else
     else
         printf "\n"
         printf "${BOLDGREEN}✓ InfluxDB 3 ${EDITION} is now installed. Nice!${NC}\n"
+    fi
+
+    # With the UI on and the server up, check the UI and open the browser.
+    # Nothing runs after a failed startup or a skipped one.
+    if [ "$USE_EMBEDDED_UI" = true ] && [ "${SUCCESS:-0}" -eq 1 ]; then
+        check_embedded_ui
     fi
 fi
 
@@ -2251,12 +2431,10 @@ if [ "${EDITION}" = "Enterprise" ] && [ "$SUCCESS" -eq 0 ] 2>/dev/null; then
     fi
     printf "├─ ${BOLD}Check the log:${NC} %s\n" "$LOG_FILE"
     printf "├─ ${BOLD}Manual startup:${NC} Try running the server manually to see detailed logs:\n"
-    printf "     influxdb3 serve \\\\\n"
-    printf "     --cluster-id=%s \\\\\n" "${CLUSTER_ID:-cluster0}"
-    printf "     --node-id=%s \\\\\n" "${NODE_ID:-node0}"
-    printf "     --license-type=%s \\\\\n" "${LICENSE_TYPE:-trial}"
-    printf "     --license-email=%s \\\\\n" "${LICENSE_EMAIL:-your@email.com}"
-    printf "     %s\n" "${STORAGE_FLAGS_ECHO:-"--object-store=file --data-dir $INSTALL_LOC/data --plugin-dir $INSTALL_LOC/plugins"}"
+    display_enterprise_manual_command
+    if [ "$USE_EMBEDDED_UI" = true ]; then
+        printf "├─ ${BOLD}Open Explorer UI:${NC} ${BLUE}http://localhost:%s${NC} once the server is running\n" "$PORT"
+    fi
     printf "└─ ${BOLD}Common issues:${NC} Network connectivity, invalid email format, port conflicts\n"
 else
     printf "${BOLD}Next Steps${NC}\n"
@@ -2265,11 +2443,26 @@ else
     else
         printf "├─ Access InfluxDB with the ${BOLD}influxdb3${NC} command.\n"
     fi
-    printf "├─ Create admin token: ${BOLD}influxdb3 create token --admin${NC}\n"
+    if [ "$USE_EMBEDDED_UI" = true ] && [ "${SUCCESS:-0}" -eq 1 ]; then
+        printf "├─ ${BOLD}Open Explorer UI:${NC} ${BLUE}http://localhost:%s${NC}\n" "$PORT"
+        if [ "$UI_READY" = false ]; then
+            printf "│  ${DIM}If the page does not load, check the log: %s${NC}\n" "$LOG_FILE"
+        fi
+    elif [ "$USE_EMBEDDED_UI" = true ]; then
+        # Installed without starting: show the command that enables the UI
+        printf "├─ Start InfluxDB with the embedded Explorer UI:\n"
+        display_enterprise_manual_command
+        printf "├─ ${BOLD}Open Explorer UI:${NC} ${BLUE}http://localhost:%s${NC} once the server is running\n" "$PORT"
+    else
+        printf "├─ Create admin token: ${BOLD}influxdb3 create token --admin${NC}\n"
+    fi
     printf "└─ Begin writing data! Learn more at https://docs.influxdata.com/influxdb3/${EDITION_TAG}/get-started/write/\n\n"
 fi
 
-printf "┌────────────────────────────────────────────────────────────────────────────────────────┐\n"
-printf "│ Looking to use a UI for querying, plugins, management, and more?                       │\n"
-printf "│ Get InfluxDB 3 Explorer at ${BLUE}https://docs.influxdata.com/influxdb3/explorer/#quick-start${NC} │\n"
-printf "└────────────────────────────────────────────────────────────────────────────────────────┘\n\n"
+# Explorer is a separate install only where the server does not embed it
+if [ "$USE_EMBEDDED_UI" = false ]; then
+    printf "┌────────────────────────────────────────────────────────────────────────────────────────┐\n"
+    printf "│ Looking to use a UI for querying, plugins, management, and more?                       │\n"
+    printf "│ Get InfluxDB 3 Explorer at ${BLUE}https://docs.influxdata.com/influxdb3/explorer/#quick-start${NC} │\n"
+    printf "└────────────────────────────────────────────────────────────────────────────────────────┘\n\n"
+fi
