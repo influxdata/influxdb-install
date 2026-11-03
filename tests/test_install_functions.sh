@@ -676,7 +676,7 @@ reset_shims new ok ok
 run_setup enterprise "$E2E_DIR" "user@example.com" trial; RC=$?
 check_equal "e2e fresh: returns 0" 0 "$RC"
 check_file_has "e2e fresh: image pulled" "$SHIM_LOG" "docker compose pull influxdb3-enterprise"
-check_file_has "e2e fresh: key generated with the image's openssl" "$SHIM_LOG" "docker run --rm --entrypoint openssl influxdb:3.12.1-enterprise genrsa 2048"
+check_file_has "e2e fresh: key generated with the image's openssl" "$SHIM_LOG" "docker run --rm --entrypoint openssl influxdb:3.12.1-enterprise genrsa -traditional 4096"
 check_file_has "e2e fresh: server started" "$SHIM_LOG" "docker compose up -d influxdb3-enterprise"
 check_file_has "e2e fresh: user created" "$SHIM_LOG" "docker exec -e INFLUXDB3_AUTH_TOKEN influxdb3-enterprise influxdb3 create user --username admin --role Admin --require-password-reset"
 check_file_has "e2e fresh: browser opened" "$SHIM_LOG" "open http://localhost:8181"

@@ -104,7 +104,7 @@
 #     License Type:       (Enterprise only) Passed as INFLUXDB3_LICENSE_TYPE
 #                         (INFLUXDB3_ENTERPRISE_LICENSE_TYPE before 3.11)
 #                         from .env; omitted when unknown (older .env)
-#     JWT Signing Key:    (Enterprise 3.12.0+) 2048-bit PKCS#1 RSA key, generated
+#     JWT Signing Key:    (Enterprise 3.12.0+) 4096-bit PKCS#1 RSA key, generated
 #                         with the image's openssl, stored as a quoted multi-line
 #                         JWT_PRIVATE_KEY in .env, passed as INFLUXDB3_JWT_PRIVATE_KEY
 #
@@ -590,14 +590,16 @@ is_jwt_private_key() {
     return 1
 }
 
-# Prints a 2048-bit PKCS#1 RSA key using "$@" as the openssl command.
-# LibreSSL (macOS /usr/bin/openssl) writes PKCS#1 by default and rejects
-# -traditional; OpenSSL 3 and later write PKCS#8 by default and need it.
+# Prints a 4096-bit PKCS#1 RSA key using "$@" as the openssl command.
+# OpenSSL 3 and later (the Docker image and most Linux hosts) write PKCS#8
+# by default and need -traditional; LibreSSL (macOS /usr/bin/openssl) and
+# OpenSSL 1 reject that flag and write PKCS#1 by default, so the plain form
+# is the fallback.
 # Returns: 1 when neither form yields a PKCS#1 key
 openssl_pkcs1_key() {
-    GENERATED_KEY=$("$@" genrsa 2048 2>/dev/null) || GENERATED_KEY=""
+    GENERATED_KEY=$("$@" genrsa -traditional 4096 2>/dev/null) || GENERATED_KEY=""
     if ! is_jwt_private_key "$GENERATED_KEY"; then
-        GENERATED_KEY=$("$@" genrsa -traditional 2048 2>/dev/null) || GENERATED_KEY=""
+        GENERATED_KEY=$("$@" genrsa 4096 2>/dev/null) || GENERATED_KEY=""
     fi
     is_jwt_private_key "$GENERATED_KEY" || return 1
     printf '%s\n' "$GENERATED_KEY"
@@ -619,7 +621,7 @@ generate_jwt_private_key() {
     if command -v ssh-keygen >/dev/null 2>&1; then
         KEYGEN_DIR=$(mktemp -d 2>/dev/null) || return 1
         GENERATED_KEY=""
-        if ssh-keygen -q -m PEM -t rsa -b 2048 -N '' -f "$KEYGEN_DIR/key" </dev/null >/dev/null 2>&1; then
+        if ssh-keygen -q -m PEM -t rsa -b 4096 -N '' -f "$KEYGEN_DIR/key" </dev/null >/dev/null 2>&1; then
             GENERATED_KEY=$(cat "$KEYGEN_DIR/key" 2>/dev/null) || GENERATED_KEY=""
         fi
         rm -rf "$KEYGEN_DIR"
