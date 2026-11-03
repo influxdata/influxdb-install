@@ -368,7 +368,7 @@ printf 'env INFLUXDB3_AUTH_TOKEN=%s\n' "${INFLUXDB3_AUTH_TOKEN:-unset}" >> "$SHI
 case "$*" in
     *"create user"*)
         case "${SHIM_CREATE:-ok}" in
-            ok) printf 'User created\nUsername: admin\nTemporary password: password\n'; exit 0 ;;
+            ok) printf '{ "userId": 0, "username": "admin", "password": "password" }\n'; exit 0 ;;
             exists) printf 'Create command failed: username already exists: admin\n' >&2; exit 1 ;;
             other-exists) printf 'Create command failed: role admin already exists\n' >&2; exit 1 ;;
             *) printf 'Create command failed: unauthorized\n' >&2; exit 1 ;;
@@ -447,7 +447,7 @@ check_file_has "fresh: the token reaches the CLI through the environment" "$SHIM
 check_file_has "fresh: create user runs inside the container with the expected flags" "$SHIM_LOG" "docker exec -e INFLUXDB3_AUTH_TOKEN $CONTAINER influxdb3 create user --username admin --role Admin --require-password-reset"
 if grep '^docker ' "$SHIM_LOG" | grep -qF "$TOKEN_FIXTURE"; then fail "fresh: the token must not be on the docker command line"; else pass; fi
 case "$FIRST_USER_OUTPUT" in
-    *"Temporary password: password"*) pass ;;
+    *'"username": "admin", "password": "password"'*) pass ;;
     *) fail "fresh: FIRST_USER_OUTPUT must hold the CLI output" ;;
 esac
 
@@ -532,7 +532,7 @@ finish_embedded_ui_setup "$CONTAINER" "$FIN_DIR" > "$TMP/out"
 wait
 check_file_has "finish fresh: smoke check succeeds" "$TMP/out" "Checking InfluxDB 3 Explorer...SUCCESS"
 check_file_has "finish fresh: sign-in box" "$TMP/out" "EXPLORER SIGN-IN: Save the temporary password. It will not be shown again."
-check_file_has "finish fresh: CLI output shown" "$TMP/out" "Temporary password: password"
+check_file_has "finish fresh: CLI output shown" "$TMP/out" '"username": "admin", "password": "password"'
 check_file_has "finish fresh: deployed with Explorer" "$TMP/out" "InfluxDB 3 Enterprise with InfluxDB 3 Explorer successfully deployed"
 check_file_has "finish fresh: sign-in hint" "$TMP/out" "sign in as admin; the UI asks for a new password"
 check_file_has "finish fresh: browser opened" "$SHIM_LOG" "open http://localhost:8181"
