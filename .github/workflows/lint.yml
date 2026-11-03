@@ -18,7 +18,7 @@ jobs:
         # The shebang is #!/bin/sh, so shellcheck applies its POSIX sh rules and
         # flags bashisms. Notes are excluded: the script has ~100 SC2059 hits
         # from its coloured printf output, which are not worth churning.
-        run: shellcheck --severity=warning install_influxdb.sh tests/test_install_functions.sh
+        run: shellcheck --severity=warning install_influxdb.sh tests/*.sh
 
   tests:
     name: unit tests (${{ matrix.os }})
@@ -33,4 +33,4 @@ jobs:
         # Loads each helper out of install_influxdb.sh and checks it with
         # fixed inputs and command shims; the compose check also runs
         # "docker compose config" where Docker is present
-        run: sh tests/test_install_functions.sh
+        run: env -u OS sh tests/test_install_functions.sh

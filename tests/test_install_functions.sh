@@ -32,28 +32,8 @@ SCRIPT=$(cd "$(dirname "$0")/.." && pwd)/install_influxdb.sh
 PASSED=0
 FAILED=0
 
-load_function() {
-    BODY=$(awk -v name="$1" '
-        $0 == name "() {" { in_fn = 1 }
-        in_fn {
-            print
-            if (heredoc != "") {
-                if ($0 == heredoc) heredoc = ""
-                next
-            }
-            if (match($0, /<< *["'"'"']?[A-Za-z_]+/)) {
-                heredoc = substr($0, RSTART, RLENGTH)
-                sub(/<< *["'"'"']?/, "", heredoc)
-                next
-            }
-            if ($0 == "}") exit
-        }' "$SCRIPT")
-    if [ -z "$BODY" ]; then
-        printf 'cannot find function %s in %s\n' "$1" "$SCRIPT" >&2
-        exit 2
-    fi
-    eval "$BODY"
-}
+# shellcheck source=tests/load_install_function.sh
+. "$(dirname "$SCRIPT")/tests/load_install_function.sh"
 
 pass() {
     PASSED=$((PASSED + 1))
@@ -93,6 +73,11 @@ check_file_lacks() {
 BOLD=""; DIM=""; BLUE=""; NC=""; YELLOW=""; BOLDGREEN=""; RED=""
 MANUAL_TOKEN_MSG="MANUAL_TOKEN_CREATION_REQUIRED"
 FIRST_EXPLORER_USER="admin"
+# generate_session_secret picks shasum or sha256sum from OS, as the script does
+case "$(uname -s)" in
+    Darwin*) OS="Darwin" ;;
+    *)       OS="Linux" ;;
+esac
 
 load_function version_at_least
 load_function has_embedded_ui
@@ -401,8 +386,24 @@ case "$*" in
         exit 0
         ;;
     *"--entrypoint openssl "*)
-        printf '%s\n' "$SHIM_PKCS1"
-        exit 0
+        # openssl3: -traditional yields PKCS#1 at once, the plain form PKCS#8
+        # libressl: rejects -traditional, the plain form yields PKCS#1
+        case "${SHIM_IMAGE_KEY:-openssl3}" in
+            openssl3)
+                case "$*" in
+                    *"genrsa -traditional 4096") printf '%s\n' "$SHIM_PKCS1" ;;
+                    *) printf '%s\n' "$SHIM_PKCS8" ;;
+                esac
+                exit 0
+                ;;
+            libressl)
+                case "$*" in
+                    *"genrsa 4096") printf '%s\n' "$SHIM_PKCS1"; exit 0 ;;
+                    *) exit 1 ;;
+                esac
+                ;;
+            *) exit 1 ;;
+        esac
         ;;
 esac
 exit 1
@@ -747,6 +748,91 @@ check_equal "e2e bad key: .env holds the new key" "$PKCS1" "$(read_env_jwt_priva
 check_equal "e2e bad key: user record survives the second write" "admin" "$(read_env_value "$E2E_DIR/.env" EXPLORER_USER)"
 check_equal "e2e bad key: session secret kept" "$E2E_SECRET" "$(read_env_value "$E2E_DIR/.env" SESSION_SECRET)"
 check_equal "e2e bad key: email kept" "user@example.com" "$(read_env_value "$E2E_DIR/.env" INFLUXDB_EMAIL)"
+
+# --- Key-generation retries and fallbacks ---
+# These commands replace host generators too, so the result does not depend
+# on the OpenSSL version or ssh-keygen installed on the test machine.
+KEYGEN_BIN="$TMP/keygen-bin"
+mkdir -p "$KEYGEN_BIN" "$TMP/keygen-scratch"
+cat > "$KEYGEN_BIN/openssl" <<'STUB'
+#!/bin/sh
+printf 'openssl %s\n' "$*" >> "$SHIM_LOG"
+case "${SHIM_HOST_KEY:-fail}" in
+    pkcs1) printf '%s\n' "$SHIM_PKCS1" ;;
+    *) exit 1 ;;
+esac
+STUB
+cat > "$KEYGEN_BIN/ssh-keygen" <<'STUB'
+#!/bin/sh
+printf 'ssh-keygen %s\n' "$*" >> "$SHIM_LOG"
+[ "${SHIM_SSH_KEY:-fail}" = pkcs1 ] || exit 1
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = -f ]; then
+        printf '%s\n' "$SHIM_PKCS1" > "$2"
+        exit 0
+    fi
+    shift
+done
+exit 1
+STUB
+chmod +x "$KEYGEN_BIN/openssl" "$KEYGEN_BIN/ssh-keygen"
+PATH="$KEYGEN_BIN:$PATH"
+SHIM_PKCS8="$PKCS8"
+SHIM_HOST_KEY=fail
+SHIM_SSH_KEY=fail
+export SHIM_PKCS8 SHIM_IMAGE_KEY SHIM_HOST_KEY SHIM_SSH_KEY
+
+reset_shims
+SHIM_IMAGE_KEY=openssl3
+KEY_OUTPUT=$(generate_jwt_private_key "$DOCKER_IMAGE"); RC=$?
+check_equal "key image: returns 0" 0 "$RC"
+check_equal "key image: returns the key" "$PKCS1" "$KEY_OUTPUT"
+check_file_has "key image: tries -traditional first" "$SHIM_LOG" "docker run --rm --entrypoint openssl $DOCKER_IMAGE genrsa -traditional 4096"
+check_file_lacks "key image: no unnecessary retry" "$SHIM_LOG" "$DOCKER_IMAGE genrsa 4096"
+check_file_lacks "key image: no host fallback" "$SHIM_LOG" "openssl genrsa"
+
+reset_shims
+SHIM_IMAGE_KEY=libressl
+KEY_OUTPUT=$(generate_jwt_private_key "$DOCKER_IMAGE"); RC=$?
+check_equal "key LibreSSL: returns 0 after retry" 0 "$RC"
+check_equal "key LibreSSL: returns PKCS1" "$PKCS1" "$KEY_OUTPUT"
+check_file_has "key LibreSSL: retries without -traditional" "$SHIM_LOG" "docker run --rm --entrypoint openssl $DOCKER_IMAGE genrsa 4096"
+check_file_lacks "key LibreSSL: no host fallback" "$SHIM_LOG" "openssl genrsa"
+
+reset_shims
+SHIM_IMAGE_KEY=fail
+SHIM_HOST_KEY=pkcs1
+KEY_OUTPUT=$(generate_jwt_private_key "$DOCKER_IMAGE"); RC=$?
+check_equal "key host: returns 0" 0 "$RC"
+check_equal "key host: returns the key" "$PKCS1" "$KEY_OUTPUT"
+check_file_has "key host: exhausts image retries" "$SHIM_LOG" "$DOCKER_IMAGE genrsa 4096"
+check_file_has "key host: calls host OpenSSL" "$SHIM_LOG" "openssl genrsa -traditional 4096"
+check_file_lacks "key host: stops before ssh-keygen" "$SHIM_LOG" "ssh-keygen"
+
+reset_shims
+SHIM_HOST_KEY=fail
+SHIM_SSH_KEY=pkcs1
+KEY_OUTPUT=$(TMPDIR="$TMP/keygen-scratch" generate_jwt_private_key "$DOCKER_IMAGE"); RC=$?
+check_equal "key ssh: returns 0" 0 "$RC"
+check_equal "key ssh: returns the key" "$PKCS1" "$KEY_OUTPUT"
+check_file_has "key ssh: exhausts host retries" "$SHIM_LOG" "openssl genrsa 4096"
+check_file_has "key ssh: uses PEM RSA" "$SHIM_LOG" "ssh-keygen -q -m PEM -t rsa -b 4096 -N  -f"
+check_equal "key ssh: removes its temporary files" "" "$(ls -A "$TMP/keygen-scratch")"
+
+reset_shims
+SHIM_SSH_KEY=fail
+KEY_OUTPUT=$(TMPDIR="$TMP/keygen-scratch" generate_jwt_private_key "$DOCKER_IMAGE"); RC=$?
+check_equal "key failure: returns 1" 1 "$RC"
+check_equal "key failure: prints no key" "" "$KEY_OUTPUT"
+check_file_has "key failure: tries the last generator" "$SHIM_LOG" "ssh-keygen"
+check_equal "key failure: removes its temporary files" "" "$(ls -A "$TMP/keygen-scratch")"
+
+# Exercise the real orchestration failure branch with every generator failing.
+reset_shims
+run_setup enterprise "$TMP/key-failure" "user@example.com" trial; RC=$?
+check_equal "setup key failure: returns 1" 1 "$RC"
+check_file_has "setup key failure: explains the failure" "$TMP/out" "Could not generate an RSA key"
+check_file_lacks "setup key failure: never starts a container" "$SHIM_LOG" "docker compose up"
 
 PATH="$ORIG_PATH"
 export PATH
