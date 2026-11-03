@@ -1311,8 +1311,9 @@ setup_first_explorer_user() {
         FIRST_USER_STATE=created
         return 0
     fi
+    # The CLI reports a duplicate as "username already exists: <name>"
     case "$FIRST_USER_OUTPUT" in
-        *"already exists"*)
+        *"username already exists"*)
             FIRST_USER_STATE=exists
             return 0
             ;;
@@ -1414,7 +1415,7 @@ finish_embedded_ui_setup() {
             display_first_user_steps "An earlier install created the operator token, so the server skips Explorer's setup page and has no user yet." "$CONTAINER_NAME" "$UI_URL"
             ;;
         no_token)
-            printf "${YELLOW}The operator token could not be created: the API at %s did not answer.${NC}\n" "$UI_URL"
+            printf "${YELLOW}The operator token could not be created: the API at %s did not return one.${NC}\n" "$UI_URL"
             printf "Re-run this script once the server is healthy (check: docker logs %s).\n" "$CONTAINER_NAME"
             printf "Until then the first client to open ${BLUE}%s${NC} becomes the admin, so open it now or stop the container.\n" "$UI_URL"
             ;;
@@ -1454,8 +1455,9 @@ setup_docker_compose() {
     fi
 
     # Enterprise 3.12.0+ serves the Explorer UI from the server itself with
-    # user authentication, so no Explorer container runs and no token is
-    # created. Core, and Enterprise below 3.12.0, keep the Explorer container.
+    # user authentication, so no Explorer container runs; the operator token
+    # and the first user are created after startup instead. Core, and
+    # Enterprise below 3.12.0, keep the Explorer container.
     # The image is pinned to INFLUXDB_VERSION, so the check matches the
     # version that runs.
     if has_embedded_ui; then

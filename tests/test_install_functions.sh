@@ -4,7 +4,8 @@
 #
 # The script runs its installation flow at load time, so the tests do not
 # source it. Instead each test loads one function's definition from the file:
-# the lines from "name() {" at column 0 to the next "}" at column 0.
+# the lines from "name() {" at column 0 to the next "}" at column 0 that is
+# not inside a here-document.
 #
 # The commands those functions call (curl, docker, open, xdg-open) are
 # replaced by shims in a scratch directory for the first-user tests, so no
@@ -32,7 +33,21 @@ PASSED=0
 FAILED=0
 
 load_function() {
-    BODY=$(sed -n "/^$1() {/,/^}/p" "$SCRIPT")
+    BODY=$(awk -v name="$1" '
+        $0 == name "() {" { in_fn = 1 }
+        in_fn {
+            print
+            if (heredoc != "") {
+                if ($0 == heredoc) heredoc = ""
+                next
+            }
+            if (match($0, /<< *["'"'"']?[A-Za-z_]+/)) {
+                heredoc = substr($0, RSTART, RLENGTH)
+                sub(/<< *["'"'"']?/, "", heredoc)
+                next
+            }
+            if ($0 == "}") exit
+        }' "$SCRIPT")
     if [ -z "$BODY" ]; then
         printf 'cannot find function %s in %s\n' "$1" "$SCRIPT" >&2
         exit 2
@@ -112,7 +127,6 @@ PKCS8="-----BEGIN PRIVATE KEY-----
 placeholder
 -----END PRIVATE KEY-----"
 TOKEN_FIXTURE="apiv3_redacted"
-OLD_TOKEN_FIXTURE="apiv3_redacted_old"
 HEX64=$(printf '%064d' 0)
 
 # --- version_at_least ---
@@ -238,7 +252,9 @@ load_jwt_private_key "$REUSE_DIR/missing" true > "$TMP/out"
 check_equal "no .env gives an empty key" "" "$JWT_PRIVATE_KEY"
 check_equal "no .env prints no key warning" "" "$(cat "$TMP/out")"
 
-# A Core run then an embedded run: the key written by the first survives
+# Helper check only: the key and the record pass through the loaders and
+# write_env_file; the production sequence is run under "setup_docker_compose
+# end to end" below
 write_env_file enterprise "$HEX64" "user@example.com" "$REUSE_DIR" trial "$PKCS1" admin
 load_jwt_private_key "$REUSE_DIR/.env" false
 EXPLORER_USER=$(read_env_value "$REUSE_DIR/.env" EXPLORER_USER) || EXPLORER_USER=""
@@ -367,10 +383,25 @@ printf 'env INFLUXDB3_AUTH_TOKEN=%s\n' "${INFLUXDB3_AUTH_TOKEN:-unset}" >> "$SHI
 case "$*" in
     *"create user"*)
         case "${SHIM_CREATE:-ok}" in
-            ok) printf 'User created\nUsername: admin\nTemporary password: placeholder-temp\n'; exit 0 ;;
+            ok) printf 'User created\nUsername: admin\nTemporary password: password\n'; exit 0 ;;
             exists) printf 'Create command failed: username already exists: admin\n' >&2; exit 1 ;;
             *) printf 'Create command failed: unauthorized\n' >&2; exit 1 ;;
         esac
+        ;;
+    "info"|"compose version"|"manifest inspect "*|"compose down"*|"compose pull "*|"compose up "*|"inspect "*)
+        exit 0
+        ;;
+    "logs "*)
+        printf 'startup time: 1s\n'
+        exit 0
+        ;;
+    "ps")
+        printf 'id  image  running  influxdb3-enterprise\n'
+        exit 0
+        ;;
+    *"--entrypoint openssl "*)
+        printf '%s\n' "$SHIM_PKCS1"
+        exit 0
         ;;
 esac
 exit 1
@@ -384,7 +415,8 @@ cp "$SHIM_BIN/open" "$SHIM_BIN/xdg-open"
 PATH="$SHIM_BIN:$ORIG_PATH"
 export PATH
 SHIM_NEW_TOKEN="$TOKEN_FIXTURE"
-export SHIM_NEW_TOKEN SHIM_TOKEN SHIM_SMOKE SHIM_CREATE
+SHIM_PKCS1="$PKCS1"
+export SHIM_NEW_TOKEN SHIM_PKCS1 SHIM_TOKEN SHIM_SMOKE SHIM_CREATE
 
 reset_shims() {
     # open_browser_url starts the opener in the background; let it finish
@@ -413,7 +445,7 @@ check_file_has "fresh: the token reaches the CLI through the environment" "$SHIM
 check_file_has "fresh: create user runs inside the container with the expected flags" "$SHIM_LOG" "docker exec -e INFLUXDB3_AUTH_TOKEN $CONTAINER influxdb3 create user --username admin --role Admin --require-password-reset"
 if grep '^docker ' "$SHIM_LOG" | grep -qF "$TOKEN_FIXTURE"; then fail "fresh: the token must not be on the docker command line"; else pass; fi
 case "$FIRST_USER_OUTPUT" in
-    *placeholder-temp*) pass ;;
+    *"Temporary password: password"*) pass ;;
     *) fail "fresh: FIRST_USER_OUTPUT must hold the CLI output" ;;
 esac
 
@@ -427,11 +459,12 @@ check_file_lacks "recorded user: no token box" "$TMP/out" "OPERATOR TOKEN"
 
 # Upgrade from the old Explorer layout: the token exists and config.json holds it
 mkdir -p "$FU_DIR/explorer/config"
-printf '{\n  "DEFAULT_API_TOKEN": "%s"\n}\n' "$OLD_TOKEN_FIXTURE" > "$FU_DIR/explorer/config/config.json"
+printf '{\n  "DEFAULT_API_TOKEN": "%s"\n}\n' "$TOKEN_FIXTURE" > "$FU_DIR/explorer/config/config.json"
 reset_shims conflict ok
 setup_first_explorer_user "$CONTAINER" "$FU_DIR" "" > "$TMP/out"; RC=$?
 check_equal "old layout: state is created" created "$FIRST_USER_STATE"
-check_file_has "old layout: the stored token is used" "$SHIM_LOG" "env INFLUXDB3_AUTH_TOKEN=$OLD_TOKEN_FIXTURE"
+# The token API answered 409, so the only token the CLI can have is the stored one
+check_file_has "old layout: the stored token is used" "$SHIM_LOG" "env INFLUXDB3_AUTH_TOKEN=$TOKEN_FIXTURE"
 check_file_lacks "old layout: no token box for a reused token" "$TMP/out" "OPERATOR TOKEN"
 
 # Upgrade where the user already exists but .env does not record it
@@ -491,7 +524,7 @@ finish_embedded_ui_setup "$CONTAINER" "$FIN_DIR" > "$TMP/out"
 wait
 check_file_has "finish fresh: smoke check succeeds" "$TMP/out" "Checking InfluxDB 3 Explorer...SUCCESS"
 check_file_has "finish fresh: sign-in box" "$TMP/out" "EXPLORER SIGN-IN: Save the temporary password. It will not be shown again."
-check_file_has "finish fresh: CLI output shown" "$TMP/out" "Temporary password: placeholder-temp"
+check_file_has "finish fresh: CLI output shown" "$TMP/out" "Temporary password: password"
 check_file_has "finish fresh: deployed with Explorer" "$TMP/out" "InfluxDB 3 Enterprise with InfluxDB 3 Explorer successfully deployed"
 check_file_has "finish fresh: sign-in hint" "$TMP/out" "sign in as admin; the UI asks for a new password"
 check_file_has "finish fresh: browser opened" "$SHIM_LOG" "open http://localhost:8181"
@@ -545,6 +578,145 @@ check_file_has "finish failed: reason shown" "$TMP/out" "The first Explorer user
 check_file_has "finish failed: steps shown" "$TMP/out" "The server holds an operator token now"
 check_file_lacks "finish failed: browser not opened" "$SHIM_LOG" "open "
 if [ -f "$FIN_DIR/.env" ]; then fail "finish failed: nothing must be recorded"; else pass; fi
+
+# The token API does not answer: nothing recorded, browser closed, warning shown
+EXPLORER_USER=""
+rm -f "$FIN_DIR/.env"
+reset_shims fail ok ok
+finish_embedded_ui_setup "$CONTAINER" "$FIN_DIR" > "$TMP/out"
+wait
+check_file_has "finish no_token: reason" "$TMP/out" "The operator token could not be created: the API at http://localhost:8181 did not return one."
+check_file_has "finish no_token: re-run hint" "$TMP/out" "Re-run this script once the server is healthy (check: docker logs $CONTAINER)."
+check_file_has "finish no_token: open window warning" "$TMP/out" "the first client to open http://localhost:8181 becomes the admin"
+check_file_lacks "finish no_token: browser not opened" "$SHIM_LOG" "open "
+check_file_lacks "finish no_token: no create user call" "$SHIM_LOG" "create user"
+if [ -f "$FIN_DIR/.env" ]; then fail "finish no_token: nothing must be recorded"; else pass; fi
+check_equal "finish no_token: EXPLORER_USER stays empty" "" "$EXPLORER_USER"
+
+# The user exists but .env lost the record: the CLI says so, the run records it and opens the browser
+EXPLORER_USER=""
+rm -f "$FIN_DIR/.env"
+mkdir -p "$FIN_DIR/explorer/config"
+printf '{\n  "DEFAULT_API_TOKEN": "%s"\n}\n' "$TOKEN_FIXTURE" > "$FIN_DIR/explorer/config/config.json"
+reset_shims conflict exists ok
+finish_embedded_ui_setup "$CONTAINER" "$FIN_DIR" > "$TMP/out"
+wait
+check_file_has "finish exists-from-cli: create user was tried" "$SHIM_LOG" "create user"
+check_file_has "finish exists-from-cli: open UI line" "$TMP/out" "Open Explorer UI: http://localhost:8181"
+check_file_has "finish exists-from-cli: browser opened" "$SHIM_LOG" "open http://localhost:8181"
+check_equal "finish exists-from-cli: user recorded" "admin" "$(read_env_value "$FIN_DIR/.env" EXPLORER_USER)"
+check_equal "finish exists-from-cli: EXPLORER_USER set for the caller" admin "$EXPLORER_USER"
+check_file_lacks "finish exists-from-cli: no sign-in box" "$TMP/out" "EXPLORER SIGN-IN"
+check_file_lacks "finish exists-from-cli: no manual steps" "$TMP/out" "Create the first Explorer user before you sign in"
+rm -rf "$FIN_DIR/explorer"
+
+# .env cannot be written: the user is created, the warning shows, the run goes on
+EXPLORER_USER=""
+rm -f "$FIN_DIR/.env"
+chmod 555 "$FIN_DIR"
+reset_shims new ok ok
+finish_embedded_ui_setup "$CONTAINER" "$FIN_DIR" > "$TMP/out" 2>/dev/null
+wait
+chmod 755 "$FIN_DIR"
+if [ -f "$FIN_DIR/.env" ]; then
+    printf 'skip: %s was writable without permission (root?); the record-failure check did not run\n' "$FIN_DIR"
+else
+    check_file_has "finish record failure: warning" "$TMP/out" "Warning: Could not record the Explorer user in $FIN_DIR/.env; the next run repeats this step"
+    check_file_has "finish record failure: sign-in box still shown" "$TMP/out" "EXPLORER SIGN-IN"
+    check_file_has "finish record failure: browser opened" "$SHIM_LOG" "open http://localhost:8181"
+fi
+
+# --- setup_docker_compose end to end with the shims ---
+# The production sequence: a fresh embedded run, a re-run, and a Core run in
+# between, each checked on the .env it leaves behind
+load_function setup_docker_compose
+load_function check_docker
+load_function is_missing_image_error
+load_function check_docker_image
+load_function pull_docker_image
+load_function filter_docker_output
+load_function wait_for_container_ready
+load_function port_in_use
+load_function find_next_available_port
+load_function openssl_pkcs1_key
+load_function generate_jwt_private_key
+load_function configure_explorer_via_file
+PORT_PROBE=""
+STARTUP_TIMEOUT_CORE=30
+STARTUP_TIMEOUT_ENTERPRISE=90
+INFLUXDB_VERSION_FLAG_SET="0"
+HOME="$TMP/home-e2e"
+mkdir -p "$HOME"
+E2E_DIR="$HOME/.influxdb/docker"
+
+# Fresh Enterprise 3.12.1 run
+EDITION="Enterprise"; INFLUXDB_VERSION="3.12.1"; DOCKER_IMAGE="influxdb:3.12.1-enterprise"
+INFLUXDB_PORT=8181; EXPLORER_PORT=8888
+reset_shims new ok ok
+setup_docker_compose enterprise "$E2E_DIR" "user@example.com" trial > "$TMP/out" 2>&1 < /dev/null; RC=$?
+wait
+check_equal "e2e fresh: returns 0" 0 "$RC"
+check_file_has "e2e fresh: image pulled" "$SHIM_LOG" "docker compose pull influxdb3-enterprise"
+check_file_has "e2e fresh: key generated with the image's openssl" "$SHIM_LOG" "docker run --rm --entrypoint openssl influxdb:3.12.1-enterprise genrsa 2048"
+check_file_has "e2e fresh: server started" "$SHIM_LOG" "docker compose up -d influxdb3-enterprise"
+check_file_has "e2e fresh: user created" "$SHIM_LOG" "docker exec -e INFLUXDB3_AUTH_TOKEN influxdb3-enterprise influxdb3 create user --username admin --role Admin --require-password-reset"
+check_file_has "e2e fresh: browser opened" "$SHIM_LOG" "open http://localhost:8181"
+check_file_has "e2e fresh: token box" "$TMP/out" "OPERATOR TOKEN: Save this token. It will not be shown again."
+check_file_has "e2e fresh: sign-in box" "$TMP/out" "EXPLORER SIGN-IN"
+check_file_has "e2e fresh: compose has the webui flags" "$E2E_DIR/docker-compose.yml" "- --mode=all,webui"
+check_file_lacks "e2e fresh: no Explorer service" "$E2E_DIR/docker-compose.yml" "influxdb3-explorer"
+E2E_SECRET=$(read_env_value "$E2E_DIR/.env" SESSION_SECRET)
+check_status "e2e fresh: .env has a valid session secret" 0 is_session_secret "$E2E_SECRET"
+check_equal "e2e fresh: .env has the email" "user@example.com" "$(read_env_value "$E2E_DIR/.env" INFLUXDB_EMAIL)"
+check_equal "e2e fresh: .env has the license type" "trial" "$(read_env_value "$E2E_DIR/.env" INFLUXDB_LICENSE_TYPE)"
+check_equal "e2e fresh: .env records the user" "admin" "$(read_env_value "$E2E_DIR/.env" EXPLORER_USER)"
+check_equal "e2e fresh: .env holds the generated key" "$PKCS1" "$(read_env_jwt_private_key "$E2E_DIR/.env")"
+if [ -e "$E2E_DIR/explorer" ]; then fail "e2e fresh: explorer/ must not be created"; else pass; fi
+
+# Re-run: the token exists, the record is kept, nothing is created again.
+# The server wrote its license file during the first run, which is what
+# skips the license prompt on a real re-run
+mkdir -p "$HOME/.influxdb/data/cluster0"
+: > "$HOME/.influxdb/data/cluster0/trial_or_home_license"
+reset_shims conflict ok ok
+setup_docker_compose enterprise "$E2E_DIR" "" "" > "$TMP/out" 2>&1 < /dev/null; RC=$?
+wait
+check_equal "e2e re-run: returns 0" 0 "$RC"
+check_file_has "e2e re-run: existing stack stopped first" "$SHIM_LOG" "docker compose down"
+check_file_lacks "e2e re-run: no new key" "$SHIM_LOG" "--entrypoint openssl"
+check_file_lacks "e2e re-run: no create user call" "$SHIM_LOG" "create user"
+check_file_lacks "e2e re-run: no token box" "$TMP/out" "OPERATOR TOKEN"
+check_file_has "e2e re-run: browser opened" "$SHIM_LOG" "open http://localhost:8181"
+check_equal "e2e re-run: session secret kept" "$E2E_SECRET" "$(read_env_value "$E2E_DIR/.env" SESSION_SECRET)"
+check_equal "e2e re-run: email kept without a prompt" "user@example.com" "$(read_env_value "$E2E_DIR/.env" INFLUXDB_EMAIL)"
+check_equal "e2e re-run: license type kept" "trial" "$(read_env_value "$E2E_DIR/.env" INFLUXDB_LICENSE_TYPE)"
+check_equal "e2e re-run: user record kept" "admin" "$(read_env_value "$E2E_DIR/.env" EXPLORER_USER)"
+check_equal "e2e re-run: key kept" "$PKCS1" "$(read_env_jwt_private_key "$E2E_DIR/.env")"
+
+# Core run in between: the Explorer container path, which must keep the key and the record
+EDITION="Core"; INFLUXDB_VERSION="3.12.1"; DOCKER_IMAGE="influxdb:3.12.1-core"
+reset_shims conflict ok ok
+setup_docker_compose core "$E2E_DIR" "" "" > "$TMP/out" 2>&1 < /dev/null; RC=$?
+wait
+check_equal "e2e core: returns 0" 0 "$RC"
+check_file_has "e2e core: compose has the Explorer service" "$E2E_DIR/docker-compose.yml" "influxdb3-explorer:"
+check_file_lacks "e2e core: no webui flags" "$E2E_DIR/docker-compose.yml" "webui"
+check_file_lacks "e2e core: no create user call" "$SHIM_LOG" "create user"
+check_equal "e2e core: session secret kept" "$E2E_SECRET" "$(read_env_value "$E2E_DIR/.env" SESSION_SECRET)"
+check_equal "e2e core: key kept for the next embedded run" "$PKCS1" "$(read_env_jwt_private_key "$E2E_DIR/.env")"
+check_equal "e2e core: user record kept for the next embedded run" "admin" "$(read_env_value "$E2E_DIR/.env" EXPLORER_USER)"
+check_file_lacks "e2e core: no email for Core" "$E2E_DIR/.env" "INFLUXDB_EMAIL"
+
+# Back to Enterprise 3.12.1: still nothing to create
+EDITION="Enterprise"; INFLUXDB_VERSION="3.12.1"; DOCKER_IMAGE="influxdb:3.12.1-enterprise"
+reset_shims conflict ok ok
+setup_docker_compose enterprise "$E2E_DIR" "" "" > "$TMP/out" 2>&1 < /dev/null; RC=$?
+wait
+check_equal "e2e back to embedded: returns 0" 0 "$RC"
+check_file_lacks "e2e back to embedded: no create user call" "$SHIM_LOG" "create user"
+check_file_lacks "e2e back to embedded: no new key" "$SHIM_LOG" "--entrypoint openssl"
+check_file_has "e2e back to embedded: open UI line" "$TMP/out" "Open Explorer UI: http://localhost:8181"
+check_equal "e2e back to embedded: key kept" "$PKCS1" "$(read_env_jwt_private_key "$E2E_DIR/.env")"
 
 PATH="$ORIG_PATH"
 export PATH
