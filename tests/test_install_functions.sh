@@ -834,6 +834,308 @@ check_equal "setup key failure: returns 1" 1 "$RC"
 check_file_has "setup key failure: explains the failure" "$TMP/out" "Could not generate an RSA key"
 check_file_lacks "setup key failure: never starts a container" "$SHIM_LOG" "docker compose up"
 
+# --- Binary path: embedded Explorer UI helpers (Enterprise 3.12.0+) ---
+# The host-generator stubs above stay on PATH, so the signing key comes from
+# the openssl stub and the tests never run a real generator.
+load_function write_private_file
+load_function load_webui_session_secret
+load_function load_webui_jwt_private_key
+load_function setup_embedded_ui
+load_function check_embedded_ui
+load_function display_enterprise_server_command
+load_function display_enterprise_manual_command
+
+# The shell keeps the last definition of a name while load_function reads
+# the first, so a name defined twice would hide the body that production runs
+check_equal "no function is defined twice in the script" "" "$(grep -E '^[A-Za-z_][A-Za-z0-9_]*\(\) \{$' "$SCRIPT" | sort | uniq -d)"
+
+BIN_HOME="$TMP/binary-home"
+INSTALL_LOC="$BIN_HOME/.influxdb"
+WEBUI_SECRET_FILE="$INSTALL_LOC/webui-session-secret"
+JWT_KEY_FILE="$INSTALL_LOC/jwt-private-key.pem"
+mkdir -p "$INSTALL_LOC"
+
+# run_loader FUNCTION VARIABLE: runs a loader in its own process, as the
+# script would, and prints the exported VARIABLE as a child process sees it.
+# Stderr goes to $TMP/err; the status is the loader's.
+run_loader() {
+    (
+        unset INFLUXDB3_WEBUI_SESSION_SECRET INFLUXDB3_JWT_PRIVATE_KEY
+        "$1" 2> "$TMP/err" || exit $?
+        sh -c "printf '%s' \"\$$2\""
+    ) > "$TMP/loader-out"
+}
+
+# write_private_file: an existing readable file must not be rewritten in
+# place. A descriptor opened on the old file before the write stands in for
+# a reader who waits for the new secret.
+PRIV="$TMP/private-file"
+printf 'old\n' > "$PRIV"
+chmod 644 "$PRIV"
+exec 3< "$PRIV"
+check_status "write_private_file over a 644 file succeeds" 0 write_private_file "$PRIV" "new-secret"
+check_equal "write_private_file: new content" "new-secret" "$(cat "$PRIV")"
+check_equal "write_private_file: mode 600 after the write" "-rw-------" "$(ls -l "$PRIV" | cut -c1-10)"
+check_equal "write_private_file: an already-open descriptor cannot read the new secret" "old" "$(cat <&3)"
+exec 3<&-
+rm -f "$PRIV"
+check_status "write_private_file creates a missing file" 0 write_private_file "$PRIV" "fresh"
+check_equal "write_private_file: new file content" "fresh" "$(cat "$PRIV")"
+check_equal "write_private_file: new file mode 600" "-rw-------" "$(ls -l "$PRIV" | cut -c1-10)"
+# A failed redirection gives status 1 in bash and 2 in dash; the callers test
+# for nonzero only
+if write_private_file "$TMP/nowhere/file" "x" 2>/dev/null; then fail "write_private_file into a missing directory must fail"; else pass; fi
+
+# load_webui_session_secret
+rm -f "$WEBUI_SECRET_FILE"
+run_loader load_webui_session_secret INFLUXDB3_WEBUI_SESSION_SECRET; RC=$?
+check_equal "session secret: a missing file gives status 0" 0 "$RC"
+check_status "session secret: a new secret is exported" 0 is_session_secret "$(cat "$TMP/loader-out")"
+check_equal "session secret: the file holds the exported secret" "$(cat "$TMP/loader-out")" "$(cat "$WEBUI_SECRET_FILE")"
+check_equal "session secret: the new file is mode 600" "-rw-------" "$(ls -l "$WEBUI_SECRET_FILE" | cut -c1-10)"
+check_equal "session secret: a new file prints no warning" "" "$(cat "$TMP/err")"
+
+printf '%s\n' "$HEX64" > "$WEBUI_SECRET_FILE"
+run_loader load_webui_session_secret INFLUXDB3_WEBUI_SESSION_SECRET; RC=$?
+check_equal "session secret: a valid file gives status 0" 0 "$RC"
+check_equal "session secret: a valid file is reused unchanged" "$HEX64" "$(cat "$TMP/loader-out")"
+check_equal "session secret: reuse prints no warning" "" "$(cat "$TMP/err")"
+
+printf 'abc\n' > "$WEBUI_SECRET_FILE"
+chmod 644 "$WEBUI_SECRET_FILE"
+run_loader load_webui_session_secret INFLUXDB3_WEBUI_SESSION_SECRET; RC=$?
+check_equal "session secret: a malformed file gives status 0" 0 "$RC"
+check_file_has "session secret: a malformed file warns" "$TMP/err" "Warning: '$WEBUI_SECRET_FILE' does not hold a usable session secret; generating a new one"
+check_status "session secret: a malformed file is replaced by a valid secret" 0 is_session_secret "$(cat "$TMP/loader-out")"
+check_equal "session secret: the replacement is written" "$(cat "$TMP/loader-out")" "$(cat "$WEBUI_SECRET_FILE")"
+check_equal "session secret: a 644 file is mode 600 after the replacement" "-rw-------" "$(ls -l "$WEBUI_SECRET_FILE" | cut -c1-10)"
+
+rm -f "$WEBUI_SECRET_FILE"
+chmod 555 "$INSTALL_LOC"
+run_loader load_webui_session_secret INFLUXDB3_WEBUI_SESSION_SECRET; RC=$?
+chmod 755 "$INSTALL_LOC"
+if [ -f "$WEBUI_SECRET_FILE" ]; then
+    printf 'skip: %s was writable without permission (root?); the unwritable-directory checks did not run\n' "$INSTALL_LOC"
+else
+    check_equal "session secret: an unwritable directory gives status 1" 1 "$RC"
+    check_file_has "session secret: an unwritable directory is reported" "$TMP/err" "Could not write the Explorer session secret to '$WEBUI_SECRET_FILE'"
+    check_equal "session secret: nothing is exported on failure" "" "$(cat "$TMP/loader-out")"
+fi
+
+# load_webui_jwt_private_key
+rm -f "$JWT_KEY_FILE"
+reset_shims
+SHIM_HOST_KEY=pkcs1
+run_loader load_webui_jwt_private_key INFLUXDB3_JWT_PRIVATE_KEY; RC=$?
+check_equal "webui key: a missing file gives status 0" 0 "$RC"
+check_equal "webui key: the generated key is exported" "$PKCS1" "$(cat "$TMP/loader-out")"
+check_equal "webui key: the file holds the generated key" "$PKCS1" "$(cat "$JWT_KEY_FILE")"
+check_equal "webui key: the new file is mode 600" "-rw-------" "$(ls -l "$JWT_KEY_FILE" | cut -c1-10)"
+check_file_has "webui key: the host openssl is used" "$SHIM_LOG" "openssl genrsa -traditional 4096"
+check_file_lacks "webui key: no image openssl on the binary path" "$SHIM_LOG" "docker"
+check_equal "webui key: a new file prints no warning" "" "$(cat "$TMP/err")"
+
+reset_shims
+SHIM_HOST_KEY=fail
+run_loader load_webui_jwt_private_key INFLUXDB3_JWT_PRIVATE_KEY; RC=$?
+check_equal "webui key: a valid file gives status 0" 0 "$RC"
+check_equal "webui key: a valid file is reused unchanged" "$PKCS1" "$(cat "$TMP/loader-out")"
+check_file_lacks "webui key: reuse runs no generator" "$SHIM_LOG" "openssl"
+check_equal "webui key: reuse prints no warning" "" "$(cat "$TMP/err")"
+
+printf '%s\n' "$PKCS8" > "$JWT_KEY_FILE"
+reset_shims
+SHIM_HOST_KEY=pkcs1
+run_loader load_webui_jwt_private_key INFLUXDB3_JWT_PRIVATE_KEY; RC=$?
+check_equal "webui key: a PKCS#8 file gives status 0" 0 "$RC"
+check_file_has "webui key: a PKCS#8 file warns" "$TMP/err" "Warning: '$JWT_KEY_FILE' is not a PKCS#1 RSA private key; generating a new one. Users will need to sign in again."
+check_equal "webui key: a PKCS#8 file is replaced by a PKCS#1 key" "$PKCS1" "$(cat "$TMP/loader-out")"
+check_equal "webui key: the replacement is written" "$PKCS1" "$(cat "$JWT_KEY_FILE")"
+
+rm -f "$JWT_KEY_FILE"
+reset_shims
+SHIM_HOST_KEY=fail
+SHIM_SSH_KEY=fail
+run_loader load_webui_jwt_private_key INFLUXDB3_JWT_PRIVATE_KEY; RC=$?
+check_equal "webui key: failing generators give status 1" 1 "$RC"
+check_file_has "webui key: failing generators are reported" "$TMP/err" "Could not generate the JWT signing key. Install openssl or ssh-keygen and run this script again."
+check_file_has "webui key: ssh-keygen is tried last" "$SHIM_LOG" "ssh-keygen"
+check_equal "webui key: nothing is exported on failure" "" "$(cat "$TMP/loader-out")"
+if [ -e "$JWT_KEY_FILE" ]; then fail "webui key: no file is written on failure"; else pass; fi
+
+# The same with no generator on PATH at all: only the commands the loader
+# itself needs are reachable
+NOGEN_BIN="$TMP/nogen-bin"
+mkdir -p "$NOGEN_BIN"
+for tool in cat chmod rm sh; do
+    ln -s "$(PATH="$ORIG_PATH" command -v "$tool")" "$NOGEN_BIN/$tool"
+done
+reset_shims
+(
+    PATH="$NOGEN_BIN"
+    export PATH
+    run_loader load_webui_jwt_private_key INFLUXDB3_JWT_PRIVATE_KEY
+); RC=$?
+check_equal "webui key: no generator on PATH gives status 1" 1 "$RC"
+check_file_has "webui key: no generator on PATH is reported" "$TMP/err" "Could not generate the JWT signing key"
+check_equal "webui key: no generator on PATH runs no stub" "" "$(cat "$SHIM_LOG")"
+
+reset_shims
+SHIM_HOST_KEY=pkcs1
+chmod 555 "$INSTALL_LOC"
+run_loader load_webui_jwt_private_key INFLUXDB3_JWT_PRIVATE_KEY; RC=$?
+chmod 755 "$INSTALL_LOC"
+if [ -f "$JWT_KEY_FILE" ]; then
+    printf 'skip: %s was writable without permission (root?); the unwritable-directory key checks did not run\n' "$INSTALL_LOC"
+    rm -f "$JWT_KEY_FILE"
+else
+    check_equal "webui key: an unwritable directory gives status 1" 1 "$RC"
+    check_file_has "webui key: an unwritable directory is reported" "$TMP/err" "Could not write the JWT signing key to '$JWT_KEY_FILE'"
+    check_equal "webui key: nothing is exported when the write fails" "" "$(cat "$TMP/loader-out")"
+fi
+
+# setup_embedded_ui: the gate the main flow runs before the startup prompt.
+# run_gate prints the three variables it sets and then the two exports as a
+# child process sees them.
+run_gate() {
+    (
+        unset INFLUXDB3_WEBUI_SESSION_SECRET INFLUXDB3_JWT_PRIVATE_KEY
+        setup_embedded_ui || exit $?
+        printf '%s|%s|%s\n' "$USE_EMBEDDED_UI" "$UI_FLAGS" "$UI_READY"
+        sh -c 'printf "%s\n" "${INFLUXDB3_WEBUI_SESSION_SECRET:-unset}"'
+        sh -c 'printf "%s\n" "${INFLUXDB3_JWT_PRIVATE_KEY:-unset}"'
+    ) > "$TMP/gate-out" 2> "$TMP/err"
+}
+rm -f "$WEBUI_SECRET_FILE" "$JWT_KEY_FILE"
+reset_shims
+SHIM_HOST_KEY=pkcs1
+
+EDITION="Enterprise"; INFLUXDB_VERSION="3.11.7"
+run_gate; RC=$?
+check_equal "gate 3.11.7: returns 0" 0 "$RC"
+check_equal "gate 3.11.7: UI off, no flags" "false||false" "$(sed -n 1p "$TMP/gate-out")"
+check_equal "gate 3.11.7: no session secret exported" "unset" "$(sed -n 2p "$TMP/gate-out")"
+check_equal "gate 3.11.7: no signing key exported" "unset" "$(sed -n 3p "$TMP/gate-out")"
+if [ -e "$WEBUI_SECRET_FILE" ] || [ -e "$JWT_KEY_FILE" ]; then fail "gate 3.11.7: no secret files must be created"; else pass; fi
+check_file_lacks "gate 3.11.7: no generator runs" "$SHIM_LOG" "openssl"
+
+EDITION="Core"; INFLUXDB_VERSION="3.12.0"
+run_gate; RC=$?
+check_equal "gate Core 3.12.0: returns 0" 0 "$RC"
+check_equal "gate Core 3.12.0: UI off, no flags" "false||false" "$(sed -n 1p "$TMP/gate-out")"
+if [ -e "$WEBUI_SECRET_FILE" ] || [ -e "$JWT_KEY_FILE" ]; then fail "gate Core 3.12.0: no secret files must be created"; else pass; fi
+
+EDITION="Enterprise"; INFLUXDB_VERSION="3.12.0"
+run_gate; RC=$?
+check_equal "gate 3.12.0: returns 0" 0 "$RC"
+check_equal "gate 3.12.0: UI on with the serve flags" "true|--mode=all,webui --user-auth-type=basic --jwt-key-id=install-script|false" "$(sed -n 1p "$TMP/gate-out")"
+check_status "gate 3.12.0: a session secret is exported" 0 is_session_secret "$(sed -n 2p "$TMP/gate-out")"
+check_equal "gate 3.12.0: the signing key is exported" "$PKCS1" "$(sed -n '3,$p' "$TMP/gate-out")"
+check_equal "gate 3.12.0: the secret file is mode 600" "-rw-------" "$(ls -l "$WEBUI_SECRET_FILE" | cut -c1-10)"
+check_equal "gate 3.12.0: the key file is mode 600" "-rw-------" "$(ls -l "$JWT_KEY_FILE" | cut -c1-10)"
+check_file_has "gate 3.12.0: the key comes from the host openssl" "$SHIM_LOG" "openssl genrsa -traditional 4096"
+GATE_SECRET=$(sed -n 2p "$TMP/gate-out")
+
+reset_shims
+SHIM_HOST_KEY=fail
+run_gate; RC=$?
+check_equal "gate re-run: returns 0" 0 "$RC"
+check_equal "gate re-run: the session secret is kept" "$GATE_SECRET" "$(sed -n 2p "$TMP/gate-out")"
+check_equal "gate re-run: the signing key is kept" "$PKCS1" "$(sed -n '3,$p' "$TMP/gate-out")"
+check_file_lacks "gate re-run: no generator runs" "$SHIM_LOG" "openssl"
+check_equal "gate re-run: no warning" "" "$(cat "$TMP/err")"
+
+# The main flow is not a function. Check in place that the gate runs once,
+# that every Enterprise serve line passes the flags, and that the summary
+# branches on the gate's result.
+check_equal "main flow: setup_embedded_ui runs once" 1 "$(grep -c '^setup_embedded_ui$' "$SCRIPT")"
+ENT_SERVE=$(grep -cE '^ *"\$INSTALL_LOC/\$BINARY_NAME" serve --cluster-id=' "$SCRIPT")
+check_equal "main flow: three Enterprise serve lines" 3 "$ENT_SERVE"
+check_equal "main flow: every Enterprise serve line passes \$UI_FLAGS" "$ENT_SERVE" "$(grep -E '^ *"\$INSTALL_LOC/\$BINARY_NAME" serve --cluster-id=' "$SCRIPT" | grep -cF ' $UI_FLAGS ')"
+check_equal "main flow: no serve line passes a secret as a flag" 0 "$(grep -E '^ *"\$INSTALL_LOC/\$BINARY_NAME" serve ' "$SCRIPT" | grep -cE 'webui-session-secret|jwt-private-key')"
+check_equal "main flow: Core serve lines pass no UI flags" 0 "$(grep -E '^ *"\$INSTALL_LOC/\$BINARY_NAME" serve --node-id=' "$SCRIPT" | grep -cF 'UI_FLAGS')"
+# These lines have look-alikes on the Docker path and in the summary, so
+# each check is pinned to its own place: the call line and the line before
+# it, the summary section, or column 0
+UI_CHECK_LINE=$(grep -n -x -F '        check_embedded_ui' "$SCRIPT" | cut -d: -f1)
+check_equal "main flow: check_embedded_ui is called once" 1 "$(printf '%s\n' "$UI_CHECK_LINE" | grep -c .)"
+check_equal "main flow: the UI check runs only after a successful start" '    if [ "$USE_EMBEDDED_UI" = true ] && [ "${SUCCESS:-0}" -eq 1 ]; then' "$(sed -n "$((${UI_CHECK_LINE:-0} - 1))p" "$SCRIPT" 2>/dev/null)"
+SUMMARY=$(sed -n '/^### SUCCESS INFORMATION ###$/,$p' "$SCRIPT")
+check_equal "main flow: the summary points to the log when the UI did not answer" 1 "$(printf '%s\n' "$SUMMARY" | grep -c -F 'If the page does not load, check the log: %s')"
+check_equal "main flow: the log hint is gated on UI_READY" 1 "$(printf '%s\n' "$SUMMARY" | grep -c -F 'if [ "$UI_READY" = false ]; then')"
+check_equal "main flow: the external Explorer banner is gated at top level on no embedded UI" 1 "$(grep -c -x -F 'if [ "$USE_EMBEDDED_UI" = false ]; then' "$SCRIPT")"
+check_equal "main flow: the banner sits inside that gate" 1 "$(sed -n '/^if \[ "\$USE_EMBEDDED_UI" = false \]; then$/,/^fi$/p' "$SCRIPT" | grep -c -F 'Get InfluxDB 3 Explorer')"
+
+# check_embedded_ui: the curl shim answers / per SHIM_SMOKE; the open shim
+# logs the browser call
+PORT=8181
+reset_shims new ok ok
+check_embedded_ui > "$TMP/out"
+wait
+check_equal "ui check ok: UI_READY is true" true "$UI_READY"
+check_file_has "ui check ok: one request to /" "$SHIM_LOG" "curl -sf --max-time 5 -o /dev/null http://localhost:8181/"
+check_file_has "ui check ok: served line" "$TMP/out" "Explorer is served by InfluxDB on port 8181"
+check_file_has "ui check ok: browser opened" "$SHIM_LOG" "open http://localhost:8181"
+check_equal "ui check ok: one request only" 1 "$(grep -c '^curl ' "$SHIM_LOG")"
+
+reset_shims new ok fail
+check_embedded_ui > "$TMP/out"
+wait
+check_equal "ui check failed: UI_READY is false" false "$UI_READY"
+check_file_has "ui check failed: did-not-respond line" "$TMP/out" "Explorer did not respond at http://localhost:8181/"
+check_file_lacks "ui check failed: browser not opened" "$SHIM_LOG" "open "
+
+# display_enterprise_server_command and display_enterprise_manual_command:
+# the UI lines appear only with the UI on, and no secret value is printed
+CLUSTER_ID=cluster0; NODE_ID=node0; LICENSE_TYPE=trial; LICENSE_EMAIL=user@example.com
+STORAGE_FLAGS_ECHO="--object-store=file --data-dir $INSTALL_LOC/data --plugin-dir $INSTALL_LOC/plugins"
+UI_SECRET_LINE="INFLUXDB3_WEBUI_SESSION_SECRET=\"\$(cat '$WEBUI_SECRET_FILE')\""
+UI_KEY_LINE="INFLUXDB3_JWT_PRIVATE_KEY=\"\$(cat '$JWT_KEY_FILE')\""
+
+USE_EMBEDDED_UI=true
+display_enterprise_server_command true > "$TMP/out"
+check_file_has "quick start UI: session secret read from its file" "$TMP/out" "$UI_SECRET_LINE"
+check_file_has "quick start UI: signing key read from its file" "$TMP/out" "$UI_KEY_LINE"
+check_file_has "quick start UI: serve flags" "$TMP/out" "--mode=all,webui --user-auth-type=basic --jwt-key-id=install-script"
+check_file_has "quick start UI: license flags kept" "$TMP/out" "--license-email=user@example.com"
+check_file_lacks "quick start UI: secret value not printed" "$TMP/out" "$GATE_SECRET"
+check_file_lacks "quick start UI: key value not printed" "$TMP/out" "BEGIN RSA PRIVATE KEY"
+
+display_enterprise_server_command false > "$TMP/out"
+check_file_has "custom start UI: session secret read from its file" "$TMP/out" "$UI_SECRET_LINE"
+check_file_has "custom start UI: signing key read from its file" "$TMP/out" "$UI_KEY_LINE"
+check_file_has "custom start UI: serve flags" "$TMP/out" "--mode='all,webui' --user-auth-type='basic' --jwt-key-id='install-script'"
+
+USE_EMBEDDED_UI=false
+display_enterprise_server_command true > "$TMP/out"
+check_file_lacks "quick start no UI: no webui flags" "$TMP/out" "webui"
+check_file_lacks "quick start no UI: no environment lines" "$TMP/out" "INFLUXDB3_"
+check_file_has "quick start no UI: serve line kept" "$TMP/out" "influxdb3 serve"
+display_enterprise_server_command false > "$TMP/out"
+check_file_lacks "custom start no UI: no webui flags" "$TMP/out" "webui"
+check_file_lacks "custom start no UI: no environment lines" "$TMP/out" "INFLUXDB3_"
+
+# The manual command after Skip startup: nothing chosen yet, defaults shown
+USE_EMBEDDED_UI=true
+(
+    unset CLUSTER_ID NODE_ID LICENSE_TYPE LICENSE_EMAIL STORAGE_FLAGS_ECHO
+    display_enterprise_manual_command
+) > "$TMP/out"
+check_file_has "manual UI: session secret read from its file" "$TMP/out" "$UI_SECRET_LINE"
+check_file_has "manual UI: signing key read from its file" "$TMP/out" "$UI_KEY_LINE"
+check_file_has "manual UI: serve flags" "$TMP/out" "--mode=all,webui --user-auth-type=basic --jwt-key-id=install-script"
+check_file_has "manual UI: default cluster id" "$TMP/out" "--cluster-id=cluster0"
+check_file_has "manual UI: default node id" "$TMP/out" "--node-id=node0"
+check_file_has "manual UI: default storage flags" "$TMP/out" "--object-store=file --data-dir $INSTALL_LOC/data --plugin-dir $INSTALL_LOC/plugins"
+check_file_has "manual UI: bind line" "$TMP/out" "--http-bind=0.0.0.0:8181"
+check_file_lacks "manual UI: secret value not printed" "$TMP/out" "$GATE_SECRET"
+check_file_lacks "manual UI: key value not printed" "$TMP/out" "BEGIN RSA PRIVATE KEY"
+USE_EMBEDDED_UI=false
+display_enterprise_manual_command > "$TMP/out"
+check_file_lacks "manual no UI: no webui flags" "$TMP/out" "webui"
+check_file_lacks "manual no UI: no environment lines" "$TMP/out" "INFLUXDB3_"
+check_file_has "manual no UI: serve line kept" "$TMP/out" "influxdb3 serve"
+
 PATH="$ORIG_PATH"
 export PATH
 

@@ -9,6 +9,10 @@ shellcheck --severity=warning install_influxdb.sh tests/*.sh
 
 The helper tests replace Docker, HTTP and key generators with command shims.
 They cover OpenSSL and LibreSSL, host fallbacks, ssh-keygen and failure before startup.
+They also cover the binary path's embedded UI helpers: the secret and key
+files, the version gate, the readiness check and the displayed commands.
+The loader refuses a function name that the script defines twice, because
+the shell runs the last definition while the loader reads the first.
 
 ## Real Enterprise image
 

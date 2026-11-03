@@ -2082,12 +2082,14 @@ display_enterprise_manual_command() {
 # --- Embedded Explorer UI with user auth (Enterprise 3.12.0+) ---
 
 # Write $2 to $1 as a file readable only by its owner
-# Returns: 1 when the file cannot be written
+# Returns: nonzero when the file cannot be written
 write_private_file() {
-    # umask protects a new file; chmod covers an existing one
+    # Remove any existing file first: a redirection would reuse its inode
+    # and mode, so a world-readable leftover could be read while the new
+    # secret is written. umask protects the new file; chmod is a second guard.
     (
         umask 077
-        printf '%s\n' "$2" > "$1"
+        rm -f "$1" && printf '%s\n' "$2" > "$1"
     ) && chmod 600 "$1"
 }
 
@@ -2124,9 +2126,10 @@ load_webui_session_secret() {
 # user sign-in tokens with it and accepts only a PKCS#1 RSA key; a bad key
 # does not stop the server, it only disables sign-in. The key is passed
 # through the environment, not a flag, and reused on every run so that a
-# re-run does not sign users out.
+# re-run does not sign users out. The Docker path has its own loader,
+# load_jwt_private_key, which reads the key from .env instead.
 # Exits: 1 when no key can be generated or the file cannot be written
-load_jwt_private_key() {
+load_webui_jwt_private_key() {
     JWT_PRIVATE_KEY=""
     if [ -f "$JWT_KEY_FILE" ]; then
         JWT_PRIVATE_KEY=$(cat "$JWT_KEY_FILE" 2>/dev/null) || JWT_PRIVATE_KEY=""
@@ -2146,6 +2149,24 @@ load_jwt_private_key() {
         fi
     fi
     export INFLUXDB3_JWT_PRIVATE_KEY="$JWT_PRIVATE_KEY"
+}
+
+# Decide whether the binary path serves the embedded UI, and when it does,
+# load or create the session secret and the JWT signing key and export them
+# for the server launch. Core and Enterprise below 3.12.0 get no flags and
+# no files.
+# Sets: USE_EMBEDDED_UI, UI_FLAGS, UI_READY
+# Exits: 1 when a secret cannot be created (see the loaders)
+setup_embedded_ui() {
+    USE_EMBEDDED_UI=false
+    UI_FLAGS=""
+    UI_READY=false
+    if has_embedded_ui; then
+        USE_EMBEDDED_UI=true
+        UI_FLAGS="--mode=all,webui --user-auth-type=basic --jwt-key-id=install-script"
+        load_webui_session_secret
+        load_webui_jwt_private_key
+    fi
 }
 
 # Smoke check for the embedded UI. The server loads the UI before its HTTP
@@ -2323,15 +2344,7 @@ export INFLUXDB3_SERVE_INVOCATION_METHOD="install-script"
 # session secret and the JWT signing key so that the displayed serve command
 # is real. The browser's setup page creates the first admin; the script
 # creates no users and no tokens. Core and older Enterprise are unchanged.
-USE_EMBEDDED_UI=false
-UI_FLAGS=""
-UI_READY=false
-if has_embedded_ui; then
-    USE_EMBEDDED_UI=true
-    UI_FLAGS="--mode=all,webui --user-auth-type=basic --jwt-key-id=install-script"
-    load_webui_session_secret
-    load_jwt_private_key
-fi
+setup_embedded_ui
 
 if [ "${EDITION}" = "Core" ]; then
     # Prompt user for startup options
