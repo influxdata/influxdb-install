@@ -15,9 +15,9 @@
 #      - Auto-creates docker-compose.yml with proper networking
 #      - Enterprise 3.12.0+ serves the embedded Explorer UI from the InfluxDB
 #        container with user authentication (--mode=all,webui
-#        --user-auth-type=basic); on a new server the browser creates the
-#        first admin. Core and older Enterprise run the separate Explorer
-#        container.
+#        --user-auth-type=basic); the script creates the operator token and
+#        the first Explorer admin right after startup. Core and older
+#        Enterprise run the separate Explorer container.
 #      - Manages Explorer configuration and session secrets
 #      - Supports upgrades of existing Docker installations
 #
@@ -37,7 +37,8 @@
 #     ~/.influxdb/docker/
 #       ├── docker-compose.yml     (Docker service definitions)
 #       ├── .env                   (License email and type, session secret,
-#       │                           JWT signing key for Enterprise 3.12.0+)
+#       │                           JWT signing key and Explorer username for
+#       │                           Enterprise 3.12.0+)
 #       └── explorer/              (Explorer container only; not created for
 #           ├── db/                 Enterprise 3.12.0+, and left in place on
 #           └── config/             upgrade)
@@ -67,10 +68,10 @@
 #     - Detects existing docker-compose.yml at ~/.influxdb/docker/
 #     - Automatically upgrades in-place when detected
 #     - Reuses the license email and type, the session secret, and the JWT
-#       signing key from .env, so a re-run does not sign users out
+#       signing key from .env, so a re-run does not sign users out, and
+#       skips the first Explorer user when .env records it
 #     - Pulls the selected version and restarts containers with health checks
 #     - Preserves all data in bind-mounted directories
-#     - Reads the old edition and image version from docker-compose.yml
 #
 #   Binary:
 #     - Overwrites any existing binary at ~/.influxdb/influxdb3
@@ -96,8 +97,7 @@
 #     Port Selection:     Automatic via find_next_available_port()
 #     Session Secret:     64 hex characters from /dev/urandom; reused from .env on re-run
 #     InfluxDB Port:      Default 8181 (mapped to container 8181); the embedded
-#                         Explorer UI is served on this port, which is then
-#                         published on 127.0.0.1 only (see Embedded UI below)
+#                         Explorer UI is served on this port
 #     Explorer Port:      Default 8888 (mapped to container 8080); Explorer
 #                         container only
 #     Container Restart:  unless-stopped policy
@@ -140,15 +140,21 @@
 #     - Embedded UI (Enterprise 3.12.0+): passes --mode=all,webui,
 #       --user-auth-type=basic, and --jwt-key-id=install-script; the session
 #       secret and JWT signing key reach the server through the environment.
-#       The script creates no users and no tokens; on a new server the
-#       browser's setup page creates the first admin and shows the operator
-#       token once. Until then that page is open to any client that reaches
-#       the port, so the embedded UI's port is published on 127.0.0.1 only;
-#       the ports entry in docker-compose.yml says how to expose it.
-#     - Upgrade from Core or Enterprise below 3.12.0: the old layout's
-#       operator token skips the setup page, so the summary shows the
-#       "docker exec ... influxdb3 create user" command instead of opening
-#       the browser; the token stays in explorer/config/config.json
+#       Right after the readiness check the script creates the operator
+#       token (shown once, as on the Explorer container path) and the first
+#       Explorer admin: "influxdb3 create user --username admin --role Admin
+#       --require-password-reset" inside the container, with the token in
+#       the environment and never on a command line. The CLI prints a
+#       temporary password, and the UI asks for a new one at the first
+#       sign-in. Until the server holds a token or a user, its setup page
+#       would make the first client to reach it the admin, so the script
+#       never leaves the server in that state.
+#     - Upgrade from an install that already created an operator token (an
+#       older Docker layout, or the binary path): the token in
+#       explorer/config/config.json is reused when it is there; otherwise
+#       the summary shows the create-user command to run with that token.
+#       The username of the user the script created is recorded as
+#       EXPLORER_USER in .env, so a re-run skips this step.
 #     - Opens Explorer UI in default browser upon successful startup
 #     - Filters verbose docker compose output for cleaner display
 #
@@ -189,6 +195,7 @@ INFLUXDB_PORT=8181  # Can be changed if port is in use
 EXPLORER_PORT=8888  # Can be changed if port is in use
 readonly EXPLORER_IMAGE="influxdata/influxdb3-ui"
 readonly MANUAL_TOKEN_MSG="MANUAL_TOKEN_CREATION_REQUIRED"
+readonly FIRST_EXPLORER_USER="admin"  # the admin the embedded-UI path creates
 
 ARCHITECTURE=$(uname -m)
 ARTIFACT=""
@@ -487,39 +494,6 @@ has_embedded_ui() {
         return 1
     fi
     version_at_least "$INFLUXDB_VERSION" "3.12.0"
-}
-
-# Returns 0 if edition $1 / version $2 lacked the embedded UI (Core,
-# Enterprise below 3.12.0, or unknown version); 1 when $1 is empty.
-# Such a server may hold an operator token, which skips Explorer's setup page.
-predates_embedded_ui() {
-    installed_edition="$1"
-    installed_version="$2"
-    if [ -z "$installed_edition" ]; then
-        return 1
-    fi
-    if [ "$installed_edition" != "Enterprise" ]; then
-        return 0
-    fi
-    if [ -z "$installed_version" ]; then
-        return 0
-    fi
-    ! version_at_least "$installed_version" "3.12.0"
-}
-
-# First sign-in steps after such an upgrade: $1 create-user command, $2 UI
-# URL, $3 optional token location line
-display_first_user_instructions() {
-    printf "\n${BOLD}Create the first user before you sign in${NC}\n"
-    printf "InfluxDB 3 %s %s was installed before this run. An operator token from that\n" "$INSTALLED_EDITION" "${INSTALLED_VERSION:-(unknown version)}"
-    printf "install makes Explorer skip its setup page, so the sign-in page has no user yet.\n"
-    printf "1. Create an admin user with the operator token:\n"
-    printf "   ${BOLD}%s${NC}\n" "$1"
-    if [ -n "$3" ]; then
-        printf "   ${DIM}%s${NC}\n" "$3"
-    fi
-    printf "2. Open Explorer UI: ${BLUE}%s${NC} and sign in as that user.\n" "$2"
-    printf "${DIM}If no operator token was ever created, the setup page appears instead and creates the first admin.${NC}\n"
 }
 
 # --- Browser Integration ---
@@ -997,9 +971,8 @@ create_operator_token() {
 #   $3 - license type ("trial", "home", or empty when unknown; Enterprise only)
 #   $4 - "true" when the server embeds the Explorer UI (Enterprise 3.12.0+).
 #        The server then runs with --mode=all,webui and basic user auth, the
-#        session secret and JWT signing key come from its environment, the
-#        compose file has no Explorer service, and the InfluxDB port is
-#        published on 127.0.0.1 only.
+#        session secret and JWT signing key come from its environment, and
+#        the compose file has no Explorer service.
 generate_docker_compose_yaml() {
     EDITION_TYPE="$1"
     DOCKER_DIR="$2"
@@ -1052,13 +1025,7 @@ generate_docker_compose_yaml() {
       - INFLUXDB3_WEBUI_SESSION_SECRET=\${SESSION_SECRET}
       - INFLUXDB3_JWT_PRIVATE_KEY=\${JWT_PRIVATE_KEY}"
         EXPLORER_SERVICE=""
-        # Until the browser creates the first admin, the setup page is open
-        # to any client that reaches the port, so publish it on loopback only
-        PORT_PUBLISH="127.0.0.1:${INFLUXDB_PORT}:8181"
-        PORT_NOTE="      # 127.0.0.1 keeps the first-admin setup page off the network; use \"${INFLUXDB_PORT}:8181\" to expose the server"
     else
-        PORT_PUBLISH="${INFLUXDB_PORT}:8181"
-        PORT_NOTE=""
         EXPLORER_SERVICE="
   influxdb3-explorer:
     image: ${EXPLORER_IMAGE}
@@ -1085,9 +1052,8 @@ services:
     image: ${DOCKER_IMAGE}
     container_name: ${SERVICE_NAME}
     user: "${USER_UID}:${USER_GID}"
-    ports:${PORT_NOTE:+
-${PORT_NOTE}}
-      - "${PORT_PUBLISH}"
+    ports:
+      - "${INFLUXDB_PORT}:8181"
     command:
       - influxdb3
       - serve
@@ -1119,6 +1085,8 @@ COMPOSE_EOF
 #   $5 - license type, or empty when unknown (Enterprise only)
 #   $6 - JWT signing key (PEM), or empty when none is known yet; written on
 #        every run so a later Enterprise 3.12.0+ run finds it
+#   $7 - Explorer username the embedded-UI path created, or empty; written
+#        on every run for the same reason
 # Returns: 0 on success, 1 when the file cannot be written
 write_env_file() {
     EDITION_TYPE="$1"
@@ -1127,6 +1095,7 @@ write_env_file() {
     DOCKER_DIR="$4"
     ENV_LICENSE_TYPE="${5:-}"
     ENV_JWT_KEY="${6:-}"
+    ENV_EXPLORER_USER="${7:-}"
 
     ENV_CONTENT="SESSION_SECRET=${SESSION_SECRET}"
     if [ "$EDITION_TYPE" = "enterprise" ]; then
@@ -1136,6 +1105,10 @@ ${ENV_CONTENT}"
         fi
         ENV_CONTENT="INFLUXDB_EMAIL=${LICENSE_EMAIL}
 ${ENV_CONTENT}"
+    fi
+    if [ -n "$ENV_EXPLORER_USER" ]; then
+        ENV_CONTENT="${ENV_CONTENT}
+EXPLORER_USER=${ENV_EXPLORER_USER}"
     fi
     # The PEM spans many lines; compose reads a double-quoted value as one
     # string. It goes last so single-line readers never meet its lines.
@@ -1189,6 +1162,46 @@ read_env_jwt_private_key() {
     return 0
 }
 
+# Sets SESSION_SECRET: the one stored in env file $1 when it is 64 hex
+# characters, so Explorer sessions survive a re-run; otherwise a new one.
+# Returns: 1 when a new secret cannot be generated
+load_session_secret() {
+    SECRET_ENV_FILE="$1"
+
+    SESSION_SECRET=$(read_env_value "$SECRET_ENV_FILE" "SESSION_SECRET") || SESSION_SECRET=""
+    if is_session_secret "$SESSION_SECRET"; then
+        return 0
+    fi
+    if [ -n "$SESSION_SECRET" ]; then
+        printf "├─${YELLOW} Warning: SESSION_SECRET in %s is not a usable session secret; generating a new one${NC}\n" "$SECRET_ENV_FILE"
+    fi
+    SESSION_SECRET=$(generate_session_secret) || return 1
+    return 0
+}
+
+# Sets JWT_PRIVATE_KEY: the PKCS#1 key stored in env file $1, or empty. The
+# key is read on every run, including Core and Enterprise below 3.12.0,
+# which do not use it, so a later Enterprise 3.12.0+ run still finds it.
+# Parameters:
+#   $1 - env file path
+#   $2 - "true" when this run uses the key (embedded UI)
+load_jwt_private_key() {
+    KEY_ENV_FILE="$1"
+    KEY_IN_USE="${2:-false}"
+
+    JWT_PRIVATE_KEY=$(read_env_jwt_private_key "$KEY_ENV_FILE") || JWT_PRIVATE_KEY=""
+    if [ -z "$JWT_PRIVATE_KEY" ] || is_jwt_private_key "$JWT_PRIVATE_KEY"; then
+        return 0
+    fi
+    if [ "$KEY_IN_USE" = true ]; then
+        printf "├─${YELLOW} Warning: JWT_PRIVATE_KEY in %s is not a PKCS#1 RSA key; generating a new one. Users will need to sign in again.${NC}\n" "$KEY_ENV_FILE"
+    else
+        printf "├─${YELLOW} Warning: JWT_PRIVATE_KEY in %s is not a PKCS#1 RSA key; discarding it${NC}\n" "$KEY_ENV_FILE"
+    fi
+    JWT_PRIVATE_KEY=""
+    return 0
+}
+
 # Function to configure Explorer via file
 configure_explorer_via_file() {
     TOKEN="$1"
@@ -1230,6 +1243,190 @@ extract_token_from_explorer_config() {
     fi
     echo ""
     return 1
+}
+
+# --- First Explorer User (embedded UI) ---
+
+# Prints the operator token once, in the box both Docker paths use
+print_operator_token_box() {
+    printf "${BOLD}════════════════════════════════════════════════════════════${NC}\n"
+    printf "${BOLD}OPERATOR TOKEN: Save this token. It will not be shown again.${NC}\n"
+    printf "%s\n" "$1"
+    printf "${BOLD}════════════════════════════════════════════════════════════${NC}\n\n"
+}
+
+# Claims a server that runs with user auth. Until it holds an operator token
+# or a user, its setup page makes the first client that reaches it the
+# admin, so this runs right after the readiness check, as the Explorer
+# container path creates its token. The operator token is created first and
+# shown once; when one exists already, the one the old Explorer layout kept
+# in its config file is reused. Then "influxdb3 create user" runs inside the
+# container with the token in the environment, never on a command line. The
+# CLI generates a temporary password and prints it; the UI asks for a new
+# one at the first sign-in. The token never reaches .env.
+# Parameters:
+#   $1 - container name
+#   $2 - docker directory
+#   $3 - username a previous run recorded in .env, or empty
+# Sets FIRST_USER_STATE:
+#   created  - the user exists now; FIRST_USER_OUTPUT holds the CLI output
+#   exists   - the server already has an operator token and a user
+#   manual   - the server has an operator token this script does not know
+#   no_token - the operator token could not be created
+#   failed   - the user could not be created; FIRST_USER_OUTPUT holds why
+# Returns: 0 for created and exists, 1 otherwise
+setup_first_explorer_user() {
+    CONTAINER_NAME="$1"
+    DOCKER_DIR="$2"
+    RECORDED_USER="$3"
+    FIRST_USER_STATE=failed
+    FIRST_USER_OUTPUT=""
+
+    # A new token means a fresh server, whatever an old .env records
+    TOKEN=$(create_operator_token "$CONTAINER_NAME") || true
+    case "$TOKEN" in
+        "$MANUAL_TOKEN_MSG")
+            FIRST_USER_STATE=no_token
+            return 1
+            ;;
+        TOKEN_ALREADY_EXISTS)
+            if [ -n "$RECORDED_USER" ]; then
+                FIRST_USER_STATE=exists
+                return 0
+            fi
+            TOKEN=$(extract_token_from_explorer_config "$DOCKER_DIR") || TOKEN=""
+            if [ -z "$TOKEN" ]; then
+                FIRST_USER_STATE=manual
+                return 1
+            fi
+            ;;
+        *)
+            print_operator_token_box "$TOKEN"
+            ;;
+    esac
+
+    # -e without a value copies the variable from this environment, so the
+    # token is not in the process list on the host or in the container
+    if FIRST_USER_OUTPUT=$(INFLUXDB3_AUTH_TOKEN="$TOKEN" docker exec -e INFLUXDB3_AUTH_TOKEN "$CONTAINER_NAME" influxdb3 create user --username "$FIRST_EXPLORER_USER" --role Admin --require-password-reset 2>&1); then
+        FIRST_USER_STATE=created
+        return 0
+    fi
+    case "$FIRST_USER_OUTPUT" in
+        *"already exists"*)
+            FIRST_USER_STATE=exists
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+# Steps for the first Explorer user when the script could not create it
+# Parameters:
+#   $1 - why, one line
+#   $2 - container name
+#   $3 - UI URL
+display_first_user_steps() {
+    printf "\n${BOLD}Create the first Explorer user before you sign in${NC}\n"
+    printf "%s\n" "$1"
+    printf "Skip these steps if a user exists already.\n"
+    printf "1. Create an admin user with the operator token (an earlier install printed it once):\n"
+    printf "   ${BOLD}INFLUXDB3_AUTH_TOKEN=<operator token> docker exec -e INFLUXDB3_AUTH_TOKEN %s influxdb3 create user --username %s --role Admin --require-password-reset${NC}\n" "$2" "$FIRST_EXPLORER_USER"
+    printf "   ${DIM}The CLI prints a temporary password; the UI asks for a new one at the first sign-in.${NC}\n"
+    printf "2. Open Explorer UI: ${BLUE}%s${NC} and sign in as that user.\n" "$3"
+}
+
+# Finishes the embedded-UI path once the server is ready: one request on /,
+# the first user, the browser, and the summary. It never changes the exit
+# status: the server is up, and the summary shows what is left to do.
+# Parameters:
+#   $1 - container name
+#   $2 - docker directory
+# Reads INFLUXDB_PORT, EDITION_NAME, EXPLORER_USER, and the write_env_file
+# inputs (EDITION_TYPE, SESSION_SECRET, LICENSE_EMAIL, LICENSE_TYPE,
+# JWT_PRIVATE_KEY)
+finish_embedded_ui_setup() {
+    CONTAINER_NAME="$1"
+    DOCKER_DIR="$2"
+    UI_URL="http://localhost:${INFLUXDB_PORT}"
+
+    # Smoke check. The server loads the UI before its HTTP listener starts
+    # and serves / without a token, so the UI answers as soon as the
+    # readiness check does; one request is enough. The result only selects
+    # the summary wording and whether the browser opens.
+    UI_READY=false
+    printf "├─ Checking InfluxDB 3 Explorer..."
+    if curl -sf --max-time 5 -o /dev/null "$UI_URL/"; then
+        printf "SUCCESS\n"
+        UI_READY=true
+    else
+        printf "${YELLOW}no response${NC}\n"
+    fi
+
+    printf "└─ Setting up the first Explorer user\n\n"
+    setup_first_explorer_user "$CONTAINER_NAME" "$DOCKER_DIR" "$EXPLORER_USER" || true
+    case "$FIRST_USER_STATE" in
+        created|exists)
+            # Record the user so a re-run skips this step
+            if [ -z "$EXPLORER_USER" ]; then
+                EXPLORER_USER="$FIRST_EXPLORER_USER"
+                if ! write_env_file "$EDITION_TYPE" "$SESSION_SECRET" "$LICENSE_EMAIL" "$DOCKER_DIR" "$LICENSE_TYPE" "$JWT_PRIVATE_KEY" "$EXPLORER_USER"; then
+                    printf "${YELLOW}Warning: Could not record the Explorer user in %s/.env; the next run repeats this step${NC}\n" "$DOCKER_DIR"
+                fi
+            fi
+            if [ "$UI_READY" = true ]; then
+                open_browser_url "$UI_URL"
+            fi
+            ;;
+    esac
+
+    if [ "$FIRST_USER_STATE" = created ]; then
+        printf "${BOLD}════════════════════════════════════════════════════════════${NC}\n"
+        printf "${BOLD}EXPLORER SIGN-IN: Save the temporary password. It will not be shown again.${NC}\n"
+        printf "%s\n" "$FIRST_USER_OUTPUT"
+        printf "${BOLD}════════════════════════════════════════════════════════════${NC}\n\n"
+    fi
+
+    if [ "$UI_READY" = true ]; then
+        printf "\n${BOLDGREEN}✓ InfluxDB 3 ${EDITION_NAME} with InfluxDB 3 Explorer successfully deployed${NC}\n\n"
+    else
+        printf "\n${BOLDGREEN}✓ InfluxDB 3 ${EDITION_NAME} successfully deployed${NC}\n\n"
+    fi
+    printf "${BOLD}Access Points:${NC}\n"
+    printf "├─ Explorer UI:  ${BLUE}%s${NC}\n" "$UI_URL"
+    printf "└─ InfluxDB API: ${BLUE}%s${NC}\n\n" "$UI_URL"
+
+    printf "${BOLD}Storage Locations:${NC}\n"
+    printf "├─ InfluxDB Data:    ${DIM}%s/.influxdb/data${NC}\n" "$HOME"
+    printf "└─ InfluxDB Plugins: ${DIM}%s/.influxdb/plugins${NC}\n\n" "$HOME"
+
+    printf "${BOLD}Configuration Files:${NC}\n"
+    printf "├─ Docker Compose:   ${DIM}%s/docker-compose.yml${NC}\n" "$DOCKER_DIR"
+    printf "└─ Secrets:          ${DIM}%s/.env${NC}\n\n" "$DOCKER_DIR"
+
+    case "$FIRST_USER_STATE" in
+        created)
+            printf "${BOLD}Open Explorer UI:${NC} ${BLUE}%s${NC} and sign in as %s; the UI asks for a new password.\n" "$UI_URL" "$EXPLORER_USER"
+            ;;
+        exists)
+            printf "${BOLD}Open Explorer UI:${NC} ${BLUE}%s${NC}\n" "$UI_URL"
+            ;;
+        manual)
+            display_first_user_steps "An earlier install created the operator token, so the server skips Explorer's setup page and has no user yet." "$CONTAINER_NAME" "$UI_URL"
+            ;;
+        no_token)
+            printf "${YELLOW}The operator token could not be created: the API at %s did not answer.${NC}\n" "$UI_URL"
+            printf "Re-run this script once the server is healthy (check: docker logs %s).\n" "$CONTAINER_NAME"
+            printf "Until then the first client to open ${BLUE}%s${NC} becomes the admin, so open it now or stop the container.\n" "$UI_URL"
+            ;;
+        failed)
+            printf "${YELLOW}The first Explorer user was not created: %s${NC}\n" "$FIRST_USER_OUTPUT"
+            display_first_user_steps "The server holds an operator token now, so it skips Explorer's setup page." "$CONTAINER_NAME" "$UI_URL"
+            ;;
+    esac
+    if [ "$UI_READY" = false ]; then
+        printf "${DIM}If the page does not load, check: docker logs %s${NC}\n" "$CONTAINER_NAME"
+    fi
+    printf "\n"
 }
 
 # ==============================================================================
@@ -1339,15 +1536,9 @@ setup_docker_compose() {
 
     # Reuse the session secret from a previous run unless it is malformed,
     # so Explorer sessions survive a re-run
-    SESSION_SECRET=$(read_env_value "$DOCKER_DIR/.env" "SESSION_SECRET") || SESSION_SECRET=""
-    if ! is_session_secret "$SESSION_SECRET"; then
-        if [ -n "$SESSION_SECRET" ]; then
-            printf "├─${YELLOW} Warning: SESSION_SECRET in %s/.env is not a usable session secret; generating a new one${NC}\n" "$DOCKER_DIR"
-        fi
-        if ! SESSION_SECRET=$(generate_session_secret); then
-            printf "└─ ${RED}Error: Could not generate a session secret from /dev/urandom${NC}\n\n"
-            return 1
-        fi
+    if ! load_session_secret "$DOCKER_DIR/.env"; then
+        printf "└─ ${RED}Error: Could not generate a session secret from /dev/urandom${NC}\n\n"
+        return 1
     fi
 
     # Keep the stored email and license type when an existing license file skipped the prompt
@@ -1366,23 +1557,15 @@ setup_docker_compose() {
     fi
 
     # Reuse the JWT signing key from a previous run unless it is malformed,
-    # so user sign-ins survive a re-run. The key is read and written back on
-    # every run, including Core and Enterprise below 3.12.0, which do not use
-    # it, so a later Enterprise 3.12.0+ run still finds it. A new key is
-    # generated after the image pull, with the openssl inside the image.
-    JWT_PRIVATE_KEY=$(read_env_jwt_private_key "$DOCKER_DIR/.env") || JWT_PRIVATE_KEY=""
-    if [ -n "$JWT_PRIVATE_KEY" ] && ! is_jwt_private_key "$JWT_PRIVATE_KEY"; then
-        if [ "$USE_EMBEDDED_UI" = true ]; then
-            printf "├─${YELLOW} Warning: JWT_PRIVATE_KEY in %s/.env is not a PKCS#1 RSA key; generating a new one. Users will need to sign in again.${NC}\n" "$DOCKER_DIR"
-        else
-            printf "├─${YELLOW} Warning: JWT_PRIVATE_KEY in %s/.env is not a PKCS#1 RSA key; discarding it${NC}\n" "$DOCKER_DIR"
-        fi
-        JWT_PRIVATE_KEY=""
-    fi
+    # so user sign-ins survive a re-run; a new key is generated after the
+    # image pull, with the openssl inside the image. The Explorer username
+    # a previous run recorded is kept the same way.
+    load_jwt_private_key "$DOCKER_DIR/.env" "$USE_EMBEDDED_UI"
+    EXPLORER_USER=$(read_env_value "$DOCKER_DIR/.env" "EXPLORER_USER") || EXPLORER_USER=""
 
     printf "├─ Creating docker-compose.yml (%s)\n" "$DOCKER_IMAGE"
     generate_docker_compose_yaml "$EDITION_TYPE" "$DOCKER_DIR" "$LICENSE_TYPE" "$USE_EMBEDDED_UI"
-    if ! write_env_file "$EDITION_TYPE" "$SESSION_SECRET" "$LICENSE_EMAIL" "$DOCKER_DIR" "$LICENSE_TYPE" "$JWT_PRIVATE_KEY"; then
+    if ! write_env_file "$EDITION_TYPE" "$SESSION_SECRET" "$LICENSE_EMAIL" "$DOCKER_DIR" "$LICENSE_TYPE" "$JWT_PRIVATE_KEY" "$EXPLORER_USER"; then
         printf "└─ ${RED}Error: Could not write %s${NC}\n\n" "$DOCKER_DIR/.env"
         return 1
     fi
@@ -1403,7 +1586,7 @@ setup_docker_compose() {
             printf "└─ ${RED}Error: Could not generate an RSA key with openssl in %s, openssl, or ssh-keygen${NC}\n\n" "$DOCKER_IMAGE"
             return 1
         fi
-        if ! write_env_file "$EDITION_TYPE" "$SESSION_SECRET" "$LICENSE_EMAIL" "$DOCKER_DIR" "$LICENSE_TYPE" "$JWT_PRIVATE_KEY"; then
+        if ! write_env_file "$EDITION_TYPE" "$SESSION_SECRET" "$LICENSE_EMAIL" "$DOCKER_DIR" "$LICENSE_TYPE" "$JWT_PRIVATE_KEY" "$EXPLORER_USER"; then
             printf "${RED}FAILED${NC}\n"
             printf "└─ ${RED}Error: Could not write %s${NC}\n\n" "$DOCKER_DIR/.env"
             return 1
@@ -1424,68 +1607,7 @@ setup_docker_compose() {
     fi
 
     if [ "$USE_EMBEDDED_UI" = true ]; then
-        # Smoke check. The server loads the UI before its HTTP listener starts
-        # and serves / without a token, so the UI answers as soon as the
-        # readiness check above does; one request is enough. The result only
-        # selects the summary wording and whether the browser opens. It never
-        # changes the exit status. On a new server the browser's setup page
-        # creates the first admin; the script creates no users and no tokens.
-        # An operator token from an older install skips that page, so the
-        # summary then shows the create-user step instead of opening the
-        # browser.
-        UI_READY=false
-        printf "└─ Checking InfluxDB 3 Explorer..."
-        if curl -sf --max-time 5 -o /dev/null "http://localhost:${INFLUXDB_PORT}/"; then
-            printf "SUCCESS\n"
-            UI_READY=true
-            if ! predates_embedded_ui "$INSTALLED_EDITION" "$INSTALLED_VERSION"; then
-                open_browser_url "http://localhost:${INFLUXDB_PORT}"
-            fi
-        else
-            printf "${YELLOW}no response${NC}\n"
-        fi
-
-        if [ "$UI_READY" = true ]; then
-            printf "\n${BOLDGREEN}✓ InfluxDB 3 ${EDITION_NAME} with InfluxDB 3 Explorer successfully deployed${NC}\n\n"
-        else
-            printf "\n${BOLDGREEN}✓ InfluxDB 3 ${EDITION_NAME} successfully deployed${NC}\n\n"
-        fi
-        printf "${BOLD}Access Points:${NC}\n"
-        printf "├─ Explorer UI:  ${BLUE}http://localhost:${INFLUXDB_PORT}${NC}\n"
-        printf "└─ InfluxDB API: ${BLUE}http://localhost:${INFLUXDB_PORT}${NC}\n\n"
-
-        printf "${BOLD}Storage Locations:${NC}\n"
-        printf "├─ InfluxDB Data:    ${DIM}%s/.influxdb/data${NC}\n" "$HOME"
-        printf "└─ InfluxDB Plugins: ${DIM}%s/.influxdb/plugins${NC}\n\n" "$HOME"
-
-        printf "${BOLD}Configuration Files:${NC}\n"
-        printf "├─ Docker Compose:   ${DIM}%s/docker-compose.yml${NC}\n" "$DOCKER_DIR"
-        printf "└─ Secrets:          ${DIM}%s/.env${NC}\n\n" "$DOCKER_DIR"
-
-        if predates_embedded_ui "$INSTALLED_EDITION" "$INSTALLED_VERSION"; then
-            printf "${BOLD}Explorer UI:${NC} create the first user, then sign in (steps below)\n"
-        else
-            printf "${BOLD}Open Explorer UI:${NC} ${BLUE}http://localhost:${INFLUXDB_PORT}${NC}\n"
-        fi
-        if [ "$UI_READY" = false ]; then
-            printf "${DIM}If the page does not load, check: docker logs %s${NC}\n" "$CONTAINER_NAME"
-        fi
-
-        # The old layout's operator token skips the setup page; the upgrade
-        # leaves it in the old Explorer config
-        if predates_embedded_ui "$INSTALLED_EDITION" "$INSTALLED_VERSION"; then
-            if extract_token_from_explorer_config "$DOCKER_DIR" >/dev/null; then
-                TOKEN_HINT="The operator token from the earlier install is DEFAULT_API_TOKEN in $DOCKER_DIR/explorer/config/config.json"
-            else
-                TOKEN_HINT="Use the operator token shown when the earlier install created it."
-            fi
-            display_first_user_instructions \
-                "docker exec -it $CONTAINER_NAME influxdb3 create user --token <operator token> --username <name> --password <password> --role Admin" \
-                "http://localhost:${INFLUXDB_PORT}" \
-                "$TOKEN_HINT"
-        fi
-        printf "\n"
-
+        finish_embedded_ui_setup "$CONTAINER_NAME" "$DOCKER_DIR"
         return 0
     fi
 
@@ -1519,10 +1641,7 @@ setup_docker_compose() {
     # Display token BEFORE launching Explorer (only if newly created)
     if [ "$TOKEN" != "$MANUAL_TOKEN_MSG" ] && [ "$TOKEN" != "TOKEN_ALREADY_EXISTS" ]; then
         if [ "$TOKEN_IS_NEW" = true ]; then
-            printf "${BOLD}════════════════════════════════════════════════════════════${NC}\n"
-            printf "${BOLD}OPERATOR TOKEN: Save this token. It will not be shown again.${NC}\n"
-            printf "%s\n" "$TOKEN"
-            printf "${BOLD}════════════════════════════════════════════════════════════${NC}\n\n"
+            print_operator_token_box "$TOKEN"
         fi
 
         # Now launch Explorer after showing the token
@@ -1904,40 +2023,28 @@ printf "┌───────────────────────
 printf "│ ${BOLD}Welcome to InfluxDB!${NC} We'll make this quick.       │\n"
 printf "└───────────────────────────────────────────────────┘\n"
 
-# Record the existing install before this run changes it. Both paths share
-# ~/.influxdb/data, so either one's operator token survives an upgrade.
-INSTALLED_EDITION=""
-INSTALLED_VERSION=""
+# Check for edition mismatch
+CURRENT_EDITION=""
 if [ -f "$HOME/.influxdb/docker/docker-compose.yml" ]; then
     if grep -q "influxdb3-enterprise:" "$HOME/.influxdb/docker/docker-compose.yml" 2>/dev/null; then
-        INSTALLED_EDITION="Enterprise"
+        CURRENT_EDITION="Enterprise"
     elif grep -q "influxdb3-core:" "$HOME/.influxdb/docker/docker-compose.yml" 2>/dev/null; then
-        INSTALLED_EDITION="Core"
+        CURRENT_EDITION="Core"
     fi
-    # "image: influxdb:3.11.0-enterprise"; a floating "influxdb:3-enterprise"
-    # tag yields "3", which counts as below 3.12.0
-    INSTALLED_VERSION=$(grep -oE 'image: *influxdb:[0-9.]+' "$HOME/.influxdb/docker/docker-compose.yml" 2>/dev/null | head -n1 | sed 's/.*influxdb://') || INSTALLED_VERSION=""
 elif [ -f "$HOME/.influxdb/influxdb3" ]; then
-    # "influxdb3 InfluxDB 3 Enterprise, 3.11.0, revision ..."; read before
-    # the download overwrites the binary
-    INSTALLED_BANNER=$("$HOME/.influxdb/influxdb3" -V 2>/dev/null) || INSTALLED_BANNER=""
-    case "$INSTALLED_BANNER" in
-        *Enterprise*) INSTALLED_EDITION="Enterprise" ;;
-        *Core*) INSTALLED_EDITION="Core" ;;
-    esac
-    INSTALLED_VERSION=$(printf '%s' "$INSTALLED_BANNER" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1) || INSTALLED_VERSION=""
-    # A binary that does not run: fall back to the Enterprise license file
-    if [ -z "$INSTALLED_EDITION" ] && [ -d "$HOME/.influxdb/data" ]; then
+    # Binary exists - try to detect edition from binary if possible
+    # For now, we'll need the user to have run it at least once
+    if [ -d "$HOME/.influxdb/data" ]; then
+        # Check for Enterprise-specific license file
         if find "$HOME/.influxdb/data" -name "trial_or_home_license" 2>/dev/null | grep -q .; then
-            INSTALLED_EDITION="Enterprise"
+            CURRENT_EDITION="Enterprise"
         else
-            INSTALLED_EDITION="Core"
+            CURRENT_EDITION="Core"
         fi
     fi
 fi
 
 # Display notice if trying to install different edition
-CURRENT_EDITION="$INSTALLED_EDITION"
 if [ -n "$CURRENT_EDITION" ] && [ "$CURRENT_EDITION" != "$EDITION" ]; then
     printf "\n${YELLOW}Notice:${NC} You have InfluxDB 3 ${BOLD}%s${NC} currently installed, but are installing InfluxDB 3 ${BOLD}%s${NC}.\n" "$CURRENT_EDITION" "$EDITION"
     if [ "$EDITION" = "Enterprise" ]; then

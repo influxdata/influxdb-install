@@ -21,11 +21,16 @@ jobs:
         run: shellcheck --severity=warning install_influxdb.sh tests/test_install_functions.sh
 
   tests:
-    name: unit tests
-    runs-on: ubuntu-latest
+    name: unit tests (${{ matrix.os }})
+    strategy:
+      matrix:
+        # Linux for GNU od and the compose parse check; macOS for BSD od
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: Run the helper function tests
         # Loads each helper out of install_influxdb.sh and checks it with
-        # fixed inputs; the compose check also runs "docker compose config"
+        # fixed inputs and command shims; the compose check also runs
+        # "docker compose config" where Docker is present
         run: sh tests/test_install_functions.sh
