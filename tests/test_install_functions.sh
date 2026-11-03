@@ -14,7 +14,7 @@
 # otherwise.
 #
 # Run: sh tests/test_install_functions.sh
-# Exit status is 1 when a check fails. Needs only POSIX sh, sed, grep, od.
+# Exit status is 1 when a check fails. Needs only POSIX sh, awk, sed, grep, od.
 set -u
 
 # Byte-wise character ranges in the case patterns below
@@ -385,6 +385,7 @@ case "$*" in
         case "${SHIM_CREATE:-ok}" in
             ok) printf 'User created\nUsername: admin\nTemporary password: password\n'; exit 0 ;;
             exists) printf 'Create command failed: username already exists: admin\n' >&2; exit 1 ;;
+            other-exists) printf 'Create command failed: role admin already exists\n' >&2; exit 1 ;;
             *) printf 'Create command failed: unauthorized\n' >&2; exit 1 ;;
         esac
         ;;
@@ -498,6 +499,12 @@ case "$FIRST_USER_OUTPUT" in
     *unauthorized*) pass ;;
     *) fail "cli failure: FIRST_USER_OUTPUT must hold the CLI error" ;;
 esac
+
+# An "already exists" error about something other than the username is a failure
+reset_shims new other-exists
+setup_first_explorer_user "$CONTAINER" "$FU_DIR" "" > "$TMP/out"; RC=$?
+check_equal "other already-exists error: state is failed" failed "$FIRST_USER_STATE"
+check_equal "other already-exists error: returns 1" 1 "$RC"
 
 # The token API does not answer (create_operator_token retries with two 2 s sleeps)
 reset_shims fail ok
@@ -649,12 +656,24 @@ HOME="$TMP/home-e2e"
 mkdir -p "$HOME"
 E2E_DIR="$HOME/.influxdb/docker"
 
+# Runs setup_docker_compose as the script would: in its own process, with no
+# value left over from an earlier call or test, and with no stdin for prompts.
+# Output goes to $TMP/out; the exit status is the function's.
+run_setup() {
+    (
+        unset EXPLORER_USER SESSION_SECRET JWT_PRIVATE_KEY LICENSE_EMAIL LICENSE_TYPE LICENSE_PROMPTED
+        setup_docker_compose "$@" < /dev/null
+        RC=$?
+        wait
+        exit "$RC"
+    ) > "$TMP/out" 2>&1
+}
+
 # Fresh Enterprise 3.12.1 run
 EDITION="Enterprise"; INFLUXDB_VERSION="3.12.1"; DOCKER_IMAGE="influxdb:3.12.1-enterprise"
 INFLUXDB_PORT=8181; EXPLORER_PORT=8888
 reset_shims new ok ok
-setup_docker_compose enterprise "$E2E_DIR" "user@example.com" trial > "$TMP/out" 2>&1 < /dev/null; RC=$?
-wait
+run_setup enterprise "$E2E_DIR" "user@example.com" trial; RC=$?
 check_equal "e2e fresh: returns 0" 0 "$RC"
 check_file_has "e2e fresh: image pulled" "$SHIM_LOG" "docker compose pull influxdb3-enterprise"
 check_file_has "e2e fresh: key generated with the image's openssl" "$SHIM_LOG" "docker run --rm --entrypoint openssl influxdb:3.12.1-enterprise genrsa 2048"
@@ -679,8 +698,7 @@ if [ -e "$E2E_DIR/explorer" ]; then fail "e2e fresh: explorer/ must not be creat
 mkdir -p "$HOME/.influxdb/data/cluster0"
 : > "$HOME/.influxdb/data/cluster0/trial_or_home_license"
 reset_shims conflict ok ok
-setup_docker_compose enterprise "$E2E_DIR" "" "" > "$TMP/out" 2>&1 < /dev/null; RC=$?
-wait
+run_setup enterprise "$E2E_DIR" "" ""; RC=$?
 check_equal "e2e re-run: returns 0" 0 "$RC"
 check_file_has "e2e re-run: existing stack stopped first" "$SHIM_LOG" "docker compose down"
 check_file_lacks "e2e re-run: no new key" "$SHIM_LOG" "--entrypoint openssl"
@@ -696,8 +714,7 @@ check_equal "e2e re-run: key kept" "$PKCS1" "$(read_env_jwt_private_key "$E2E_DI
 # Core run in between: the Explorer container path, which must keep the key and the record
 EDITION="Core"; INFLUXDB_VERSION="3.12.1"; DOCKER_IMAGE="influxdb:3.12.1-core"
 reset_shims conflict ok ok
-setup_docker_compose core "$E2E_DIR" "" "" > "$TMP/out" 2>&1 < /dev/null; RC=$?
-wait
+run_setup core "$E2E_DIR" "" ""; RC=$?
 check_equal "e2e core: returns 0" 0 "$RC"
 check_file_has "e2e core: compose has the Explorer service" "$E2E_DIR/docker-compose.yml" "influxdb3-explorer:"
 check_file_lacks "e2e core: no webui flags" "$E2E_DIR/docker-compose.yml" "webui"
@@ -710,13 +727,26 @@ check_file_lacks "e2e core: no email for Core" "$E2E_DIR/.env" "INFLUXDB_EMAIL"
 # Back to Enterprise 3.12.1: still nothing to create
 EDITION="Enterprise"; INFLUXDB_VERSION="3.12.1"; DOCKER_IMAGE="influxdb:3.12.1-enterprise"
 reset_shims conflict ok ok
-setup_docker_compose enterprise "$E2E_DIR" "" "" > "$TMP/out" 2>&1 < /dev/null; RC=$?
-wait
+run_setup enterprise "$E2E_DIR" "" ""; RC=$?
 check_equal "e2e back to embedded: returns 0" 0 "$RC"
 check_file_lacks "e2e back to embedded: no create user call" "$SHIM_LOG" "create user"
 check_file_lacks "e2e back to embedded: no new key" "$SHIM_LOG" "--entrypoint openssl"
 check_file_has "e2e back to embedded: open UI line" "$TMP/out" "Open Explorer UI: http://localhost:8181"
 check_equal "e2e back to embedded: key kept" "$PKCS1" "$(read_env_jwt_private_key "$E2E_DIR/.env")"
+
+# A re-run whose stored key is malformed: the key is generated again after
+# the pull and .env is written a second time; the record must survive that
+write_env_file enterprise "$E2E_SECRET" "user@example.com" "$E2E_DIR" trial "$PKCS8" admin
+reset_shims conflict ok ok
+run_setup enterprise "$E2E_DIR" "" ""; RC=$?
+check_equal "e2e bad key: returns 0" 0 "$RC"
+check_file_has "e2e bad key: warning" "$TMP/out" "Warning: JWT_PRIVATE_KEY in $E2E_DIR/.env is not a PKCS#1 RSA key; generating a new one. Users will need to sign in again."
+check_file_has "e2e bad key: key generated again" "$SHIM_LOG" "--entrypoint openssl"
+check_file_lacks "e2e bad key: no create user call" "$SHIM_LOG" "create user"
+check_equal "e2e bad key: .env holds the new key" "$PKCS1" "$(read_env_jwt_private_key "$E2E_DIR/.env")"
+check_equal "e2e bad key: user record survives the second write" "admin" "$(read_env_value "$E2E_DIR/.env" EXPLORER_USER)"
+check_equal "e2e bad key: session secret kept" "$E2E_SECRET" "$(read_env_value "$E2E_DIR/.env" SESSION_SECRET)"
+check_equal "e2e bad key: email kept" "user@example.com" "$(read_env_value "$E2E_DIR/.env" INFLUXDB_EMAIL)"
 
 PATH="$ORIG_PATH"
 export PATH
