@@ -2079,7 +2079,30 @@ display_enterprise_manual_command() {
     printf "     %s\n" "${STORAGE_FLAGS_ECHO:-"--object-store=file --data-dir $INSTALL_LOC/data --plugin-dir $INSTALL_LOC/plugins"}"
 }
 
+# How the first Explorer admin comes to exist on the binary path. On a new
+# server the browser's setup page creates it and shows the operator token
+# once. A server that already holds an operator token (an earlier install
+# created one with "influxdb3 create token --admin") skips that page and has
+# no user, so the sign-in page cannot be used until the CLI creates one; the
+# script cannot tell the two apart without using the token, so it shows both.
+display_binary_first_user_note() {
+    printf "├─ ${BOLD}First sign-in:${NC} on a new server, Explorer's setup page creates the first admin and shows the operator token once.\n"
+    printf "│  If this server already had an operator token, Explorer skips that page and has no user yet. Create one with that token:\n"
+    printf "│  ${BOLD}INFLUXDB3_AUTH_TOKEN=<operator token> influxdb3 create user --host http://localhost:%s --username %s --role Admin --require-password-reset${NC}\n" "$PORT" "$FIRST_EXPLORER_USER"
+    printf "│  ${DIM}The CLI prints a temporary password; the UI asks for a new one at the first sign-in.${NC}\n"
+}
+
 # --- Embedded Explorer UI with user auth (Enterprise 3.12.0+) ---
+
+# Make the existing secret file $1 readable only by its owner. A file the
+# user or an older run left at a wider mode is not reused as it is.
+# Returns: 1 when the mode cannot be set, after an error message
+restrict_private_file() {
+    if ! chmod 600 "$1" 2>/dev/null; then
+        printf "\n${RED}Error:${NC} Could not restrict '%s' to its owner (chmod 600). Fix the file's ownership or mode and run this script again.\n" "$1" >&2
+        return 1
+    fi
+}
 
 # Write $2 to $1 as a file readable only by its owner
 # Returns: nonzero when the file cannot be written
@@ -2104,8 +2127,11 @@ load_webui_session_secret() {
     if [ -f "$WEBUI_SECRET_FILE" ]; then
         WEBUI_SESSION_SECRET=$(cat "$WEBUI_SECRET_FILE" 2>/dev/null) || WEBUI_SESSION_SECRET=""
     fi
-    # A malformed file (failed write, hand edit) is replaced
-    if ! is_session_secret "$WEBUI_SESSION_SECRET"; then
+    if is_session_secret "$WEBUI_SESSION_SECRET"; then
+        # Reuse only a file that no other user can read
+        restrict_private_file "$WEBUI_SECRET_FILE" || exit 1
+    else
+        # A malformed file (failed write, hand edit) is replaced
         if [ -n "$WEBUI_SESSION_SECRET" ]; then
             printf "\n${YELLOW}Warning: '%s' does not hold a usable session secret; generating a new one. Browsers signed in to Explorer will need to sign in again.${NC}\n" "$WEBUI_SECRET_FILE" >&2
         fi
@@ -2134,8 +2160,11 @@ load_webui_jwt_private_key() {
     if [ -f "$JWT_KEY_FILE" ]; then
         JWT_PRIVATE_KEY=$(cat "$JWT_KEY_FILE" 2>/dev/null) || JWT_PRIVATE_KEY=""
     fi
-    # A malformed file (PKCS#8, truncated, hand edit) is replaced
-    if ! is_jwt_private_key "$JWT_PRIVATE_KEY"; then
+    if is_jwt_private_key "$JWT_PRIVATE_KEY"; then
+        # Reuse only a file that no other user can read
+        restrict_private_file "$JWT_KEY_FILE" || exit 1
+    else
+        # A malformed file (PKCS#8, truncated, hand edit) is replaced
         if [ -n "$JWT_PRIVATE_KEY" ]; then
             printf "\n${YELLOW}Warning: '%s' is not a PKCS#1 RSA private key; generating a new one. Users will need to sign in again.${NC}\n" "$JWT_KEY_FILE" >&2
         fi
@@ -2654,6 +2683,7 @@ if [ "${EDITION}" = "Enterprise" ] && [ "$SUCCESS" -eq 0 ] 2>/dev/null; then
     display_enterprise_manual_command
     if [ "$USE_EMBEDDED_UI" = true ]; then
         printf "├─ ${BOLD}Open Explorer UI:${NC} ${BLUE}http://localhost:%s${NC} once the server is running\n" "$PORT"
+        display_binary_first_user_note
     fi
     printf "└─ ${BOLD}Common issues:${NC} Network connectivity, invalid email format, port conflicts\n"
 else
@@ -2668,11 +2698,13 @@ else
         if [ "$UI_READY" = false ]; then
             printf "│  ${DIM}If the page does not load, check the log: %s${NC}\n" "$LOG_FILE"
         fi
+        display_binary_first_user_note
     elif [ "$USE_EMBEDDED_UI" = true ]; then
         # Installed without starting: show the command that enables the UI
         printf "├─ Start InfluxDB with the embedded Explorer UI:\n"
         display_enterprise_manual_command
         printf "├─ ${BOLD}Open Explorer UI:${NC} ${BLUE}http://localhost:%s${NC} once the server is running\n" "$PORT"
+        display_binary_first_user_note
     else
         printf "├─ Create admin token: ${BOLD}influxdb3 create token --admin${NC}\n"
     fi

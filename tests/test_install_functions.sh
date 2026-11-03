@@ -15,6 +15,9 @@
 #
 # Run: sh tests/test_install_functions.sh
 # Exit status is 1 when a check fails. Needs only POSIX sh, awk, sed, grep, od.
+# The end-to-end block at the end also needs a host the installer supports
+# (Linux amd64 or arm64, or an Apple silicon Mac) with openssl or ssh-keygen;
+# it prints a "skip:" line elsewhere.
 set -u
 
 # Byte-wise character ranges in the case patterns below
@@ -837,6 +840,7 @@ check_file_lacks "setup key failure: never starts a container" "$SHIM_LOG" "dock
 # --- Binary path: embedded Explorer UI helpers (Enterprise 3.12.0+) ---
 # The host-generator stubs above stay on PATH, so the signing key comes from
 # the openssl stub and the tests never run a real generator.
+load_function restrict_private_file
 load_function write_private_file
 load_function load_webui_session_secret
 load_function load_webui_jwt_private_key
@@ -844,6 +848,7 @@ load_function setup_embedded_ui
 load_function check_embedded_ui
 load_function display_enterprise_server_command
 load_function display_enterprise_manual_command
+load_function display_binary_first_user_note
 
 # The shell keeps the last definition of a name while load_function reads
 # the first, so a name defined twice would hide the body that production runs
@@ -901,6 +906,44 @@ check_equal "session secret: a valid file gives status 0" 0 "$RC"
 check_equal "session secret: a valid file is reused unchanged" "$HEX64" "$(cat "$TMP/loader-out")"
 check_equal "session secret: reuse prints no warning" "" "$(cat "$TMP/err")"
 
+# A valid file left readable by others (an older run, a hand copy) is
+# restricted before reuse; a file whose mode cannot be set stops the run
+chmod 644 "$WEBUI_SECRET_FILE"
+run_loader load_webui_session_secret INFLUXDB3_WEBUI_SESSION_SECRET; RC=$?
+check_equal "session secret: a valid 644 file gives status 0" 0 "$RC"
+check_equal "session secret: a valid 644 file is reused" "$HEX64" "$(cat "$TMP/loader-out")"
+check_equal "session secret: a valid 644 file is mode 600 after reuse" "-rw-------" "$(ls -l "$WEBUI_SECRET_FILE" | cut -c1-10)"
+NOCHMOD_BIN="$TMP/nochmod-bin"
+mkdir -p "$NOCHMOD_BIN"
+printf '#!/bin/sh\nexit 1\n' > "$NOCHMOD_BIN/chmod"
+chmod +x "$NOCHMOD_BIN/chmod"
+(
+    PATH="$NOCHMOD_BIN:$PATH"
+    export PATH
+    run_loader load_webui_session_secret INFLUXDB3_WEBUI_SESSION_SECRET
+); RC=$?
+check_equal "session secret: a file that cannot be restricted gives status 1" 1 "$RC"
+check_file_has "session secret: the chmod failure is reported" "$TMP/err" "Could not restrict '$WEBUI_SECRET_FILE' to its owner (chmod 600)"
+check_equal "session secret: nothing is exported when chmod fails" "" "$(cat "$TMP/loader-out")"
+
+# The generator fails: neither digest tool prints a usable secret
+NOHASH_BIN="$TMP/nohash-bin"
+mkdir -p "$NOHASH_BIN"
+for tool in shasum sha256sum; do
+    printf '#!/bin/sh\nprintf "garbage\\n"\n' > "$NOHASH_BIN/$tool"
+    chmod +x "$NOHASH_BIN/$tool"
+done
+rm -f "$WEBUI_SECRET_FILE"
+(
+    PATH="$NOHASH_BIN:$PATH"
+    export PATH
+    run_loader load_webui_session_secret INFLUXDB3_WEBUI_SESSION_SECRET
+); RC=$?
+check_equal "session secret: a failed generator gives status 1" 1 "$RC"
+check_file_has "session secret: a failed generator is reported" "$TMP/err" "Could not generate the Explorer session secret from /dev/urandom."
+check_equal "session secret: nothing is exported when generation fails" "" "$(cat "$TMP/loader-out")"
+if [ -e "$WEBUI_SECRET_FILE" ]; then fail "session secret: no file is written when generation fails"; else pass; fi
+
 printf 'abc\n' > "$WEBUI_SECRET_FILE"
 chmod 644 "$WEBUI_SECRET_FILE"
 run_loader load_webui_session_secret INFLUXDB3_WEBUI_SESSION_SECRET; RC=$?
@@ -943,6 +986,21 @@ check_equal "webui key: a valid file is reused unchanged" "$PKCS1" "$(cat "$TMP/
 check_file_lacks "webui key: reuse runs no generator" "$SHIM_LOG" "openssl"
 check_equal "webui key: reuse prints no warning" "" "$(cat "$TMP/err")"
 
+chmod 644 "$JWT_KEY_FILE"
+reset_shims
+run_loader load_webui_jwt_private_key INFLUXDB3_JWT_PRIVATE_KEY; RC=$?
+check_equal "webui key: a valid 644 file gives status 0" 0 "$RC"
+check_equal "webui key: a valid 644 file is reused" "$PKCS1" "$(cat "$TMP/loader-out")"
+check_equal "webui key: a valid 644 file is mode 600 after reuse" "-rw-------" "$(ls -l "$JWT_KEY_FILE" | cut -c1-10)"
+(
+    PATH="$NOCHMOD_BIN:$PATH"
+    export PATH
+    run_loader load_webui_jwt_private_key INFLUXDB3_JWT_PRIVATE_KEY
+); RC=$?
+check_equal "webui key: a file that cannot be restricted gives status 1" 1 "$RC"
+check_file_has "webui key: the chmod failure is reported" "$TMP/err" "Could not restrict '$JWT_KEY_FILE' to its owner (chmod 600)"
+check_equal "webui key: nothing is exported when chmod fails" "" "$(cat "$TMP/loader-out")"
+
 printf '%s\n' "$PKCS8" > "$JWT_KEY_FILE"
 reset_shims
 SHIM_HOST_KEY=pkcs1
@@ -979,6 +1037,25 @@ reset_shims
 check_equal "webui key: no generator on PATH gives status 1" 1 "$RC"
 check_file_has "webui key: no generator on PATH is reported" "$TMP/err" "Could not generate the JWT signing key"
 check_equal "webui key: no generator on PATH runs no stub" "" "$(cat "$SHIM_LOG")"
+
+# The real host generator, when one is installed: the loader must produce a
+# PKCS#1 key that openssl itself accepts, with the size the server expects
+rm -f "$JWT_KEY_FILE"
+if PATH="$ORIG_PATH" command -v openssl >/dev/null 2>&1; then
+    (
+        PATH="$ORIG_PATH"
+        export PATH
+        run_loader load_webui_jwt_private_key INFLUXDB3_JWT_PRIVATE_KEY
+    ); RC=$?
+    check_equal "webui key real openssl: status 0" 0 "$RC"
+    check_status "webui key real openssl: a PKCS#1 key is exported" 0 is_jwt_private_key "$(cat "$TMP/loader-out")"
+    check_equal "webui key real openssl: the file holds the exported key" "$(cat "$TMP/loader-out")" "$(cat "$JWT_KEY_FILE")"
+    check_status "webui key real openssl: openssl accepts the key" 0 env PATH="$ORIG_PATH" openssl rsa -in "$JWT_KEY_FILE" -check -noout
+    check_equal "webui key real openssl: 4096-bit" 1 "$(env PATH="$ORIG_PATH" openssl rsa -in "$JWT_KEY_FILE" -noout -text 2>/dev/null | grep -c '4096 bit')"
+    rm -f "$JWT_KEY_FILE"
+else
+    printf 'skip: openssl not installed; the real key generation check did not run\n'
+fi
 
 reset_shims
 SHIM_HOST_KEY=pkcs1
@@ -1063,6 +1140,7 @@ check_equal "main flow: the UI check runs only after a successful start" '    if
 SUMMARY=$(sed -n '/^### SUCCESS INFORMATION ###$/,$p' "$SCRIPT")
 check_equal "main flow: the summary points to the log when the UI did not answer" 1 "$(printf '%s\n' "$SUMMARY" | grep -c -F 'If the page does not load, check the log: %s')"
 check_equal "main flow: the log hint is gated on UI_READY" 1 "$(printf '%s\n' "$SUMMARY" | grep -c -F 'if [ "$UI_READY" = false ]; then')"
+check_equal "main flow: the first-user note follows the UI summary, the skipped start and the failed start" 3 "$(printf '%s\n' "$SUMMARY" | grep -c -x '        display_binary_first_user_note')"
 check_equal "main flow: the external Explorer banner is gated at top level on no embedded UI" 1 "$(grep -c -x -F 'if [ "$USE_EMBEDDED_UI" = false ]; then' "$SCRIPT")"
 check_equal "main flow: the banner sits inside that gate" 1 "$(sed -n '/^if \[ "\$USE_EMBEDDED_UI" = false \]; then$/,/^fi$/p' "$SCRIPT" | grep -c -F 'Get InfluxDB 3 Explorer')"
 
@@ -1135,6 +1213,229 @@ display_enterprise_manual_command > "$TMP/out"
 check_file_lacks "manual no UI: no webui flags" "$TMP/out" "webui"
 check_file_lacks "manual no UI: no environment lines" "$TMP/out" "INFLUXDB3_"
 check_file_has "manual no UI: serve line kept" "$TMP/out" "influxdb3 serve"
+
+# display_binary_first_user_note: both ways the first admin comes to exist,
+# with the create-user command on the port in use
+PORT=8282
+display_binary_first_user_note > "$TMP/out"
+check_file_has "first-user note: the setup page on a new server" "$TMP/out" "Explorer's setup page creates the first admin and shows the operator token once"
+check_file_has "first-user note: the upgrade case" "$TMP/out" "If this server already had an operator token, Explorer skips that page and has no user yet"
+check_file_has "first-user note: create-user command on the port in use" "$TMP/out" "INFLUXDB3_AUTH_TOKEN=<operator token> influxdb3 create user --host http://localhost:8282 --username admin --role Admin --require-password-reset"
+check_file_has "first-user note: password reset hint" "$TMP/out" "The CLI prints a temporary password; the UI asks for a new one at the first sign-in."
+PORT=8181
+
+# --- Binary path end to end with shims ---
+# Runs the installer itself, through its "sh -e" shebang, in a scratch HOME.
+# curl, the port probe and the browser opener are shims; the download is a
+# fake tarball whose influxdb3 records its arguments and environment, prints
+# the startup line the health check waits for, and stays alive briefly.
+# The signing key comes from the real host openssl or ssh-keygen.
+#
+# The installer reads the host architecture itself and exits on one it does
+# not support, and the key needs a real generator, so the block runs only
+# where both hold
+E2E_SKIP=""
+case "$(uname -s)/$(uname -m)" in
+    Linux/x86_64|Linux/amd64|Linux/aarch64|Linux/arm64|Darwin/arm64) ;;
+    *) E2E_SKIP="the installer does not support $(uname -s) $(uname -m)" ;;
+esac
+if ! PATH="$ORIG_PATH" command -v openssl >/dev/null 2>&1 && ! PATH="$ORIG_PATH" command -v ssh-keygen >/dev/null 2>&1; then
+    E2E_SKIP="neither openssl nor ssh-keygen is installed"
+fi
+if [ -n "$E2E_SKIP" ]; then
+    printf 'skip: %s; the end-to-end installer runs did not run\n' "$E2E_SKIP"
+else
+E2E_BIN="$TMP/e2e-bin"
+E2E_HOME="$TMP/e2e-home"
+E2E_OUT="$TMP/e2e-out"
+E2E_TARBALL="$TMP/e2e.tar.gz"
+mkdir -p "$E2E_BIN" "$E2E_OUT" "$TMP/e2e-tarball"
+cat > "$TMP/e2e-tarball/influxdb3" <<'STUB'
+#!/bin/sh
+printf '%s\n' "$*" > "$E2E_OUT/serve-args"
+printf 'secret=%s\njwt=%s\n' "${INFLUXDB3_WEBUI_SESSION_SECRET:-unset}" "${INFLUXDB3_JWT_PRIVATE_KEY:-unset}" > "$E2E_OUT/serve-env"
+case "${E2E_SERVE:-ok}" in
+    ok) printf 'startup time: 1ms\n'; sleep 10 ;;
+    *) printf 'boom\n'; exit 1 ;;
+esac
+STUB
+chmod +x "$TMP/e2e-tarball/influxdb3"
+(cd "$TMP/e2e-tarball" && tar -czf "$E2E_TARBALL" influxdb3)
+if [ "$OS" = "Darwin" ]; then
+    E2E_SHA=$(shasum -a 256 "$E2E_TARBALL" | cut -d ' ' -f 1)
+else
+    E2E_SHA=$(sha256sum "$E2E_TARBALL" | cut -d ' ' -f 1)
+fi
+cat > "$E2E_BIN/curl" <<'STUB'
+#!/bin/sh
+printf 'curl %s\n' "$*" >> "$SHIM_LOG"
+eval "dest=\${$#}"
+case "$*" in
+    "-sIL "*) printf '200' ;;
+    *".sha256 -o "*) printf '%s  influxdb3.tar.gz\n' "$E2E_SHA" > "$dest" ;;
+    *".tar.gz -o "*) cp "$E2E_TARBALL" "$dest" ;;
+    *"/health"*) exit 0 ;;
+    *) [ "${SHIM_SMOKE:-ok}" = ok ] ;;
+esac
+STUB
+printf '#!/bin/sh\nexit 1\n' > "$E2E_BIN/ss"   # the port probe: every port is free
+cp "$SHIM_BIN/open" "$E2E_BIN/open"
+cp "$SHIM_BIN/open" "$E2E_BIN/xdg-open"
+chmod +x "$E2E_BIN/curl" "$E2E_BIN/ss"
+export E2E_OUT E2E_SHA E2E_TARBALL E2E_SERVE SHIM_SMOKE
+ESC=$(printf '\033')
+
+# run_installer ARGS... < answers: runs the installer in $E2E_HOME, which the
+# caller prepares. Output goes to $TMP/out, and to $TMP/out-plain without
+# colour codes; the status is the installer's.
+run_installer() {
+    mkdir -p "$E2E_HOME"
+    rm -f "$E2E_OUT/serve-args" "$E2E_OUT/serve-env"
+    : > "$SHIM_LOG"
+    (
+        cd "$TMP" || exit 2
+        HOME="$E2E_HOME"
+        SHELL=/bin/sh
+        PATH="$E2E_BIN:$ORIG_PATH"
+        export HOME SHELL PATH
+        "$SCRIPT" "$@"
+    ) > "$TMP/out" 2>&1
+    RC=$?
+    # The installer starts the browser opener in the background and does not
+    # wait for it, and this shell cannot wait for a grandchild. Give the shim
+    # time to write its line before the log is read or truncated again.
+    sleep 1
+    sed "s/$ESC\[[0-9;]*m//g" "$TMP/out" > "$TMP/out-plain"
+    return "$RC"
+}
+E2E_SECRET_FILE="$E2E_HOME/.influxdb/webui-session-secret"
+E2E_KEY_FILE="$E2E_HOME/.influxdb/jwt-private-key.pem"
+E2E_UI_FLAGS="--mode=all,webui --user-auth-type=basic --jwt-key-id=install-script"
+
+# Enterprise 3.12.0 Quick Start with an existing license file
+rm -rf "$E2E_HOME"
+mkdir -p "$E2E_HOME/.influxdb/data/cluster0"
+: > "$E2E_HOME/.influxdb/data/cluster0/trial_or_home_license"
+E2E_SERVE=ok; SHIM_SMOKE=ok
+printf '2\n1\n' | run_installer enterprise --version 3.12.0; RC=$?
+check_equal "e2e quick start: exit 0" 0 "$RC"
+check_file_has "e2e quick start: the binary was installed" "$TMP/out-plain" "tar -xf"
+check_file_has "e2e quick start: serve has the UI flags" "$E2E_OUT/serve-args" "$E2E_UI_FLAGS"
+check_file_has "e2e quick start: serve binds the port" "$E2E_OUT/serve-args" "--http-bind=0.0.0.0:8181"
+check_file_lacks "e2e quick start: no license flags with an existing license" "$E2E_OUT/serve-args" "--license-type"
+check_file_lacks "e2e quick start: the secret is not on the command line" "$E2E_OUT/serve-args" "session-secret"
+check_file_lacks "e2e quick start: the key is not on the command line" "$E2E_OUT/serve-args" "jwt-private-key"
+E2E_SECRET=$(cat "$E2E_SECRET_FILE" 2>/dev/null) || E2E_SECRET=""
+E2E_KEY=$(cat "$E2E_KEY_FILE" 2>/dev/null) || E2E_KEY=""
+check_status "e2e quick start: a session secret file was created" 0 is_session_secret "$E2E_SECRET"
+check_status "e2e quick start: a signing key file was created" 0 is_jwt_private_key "$E2E_KEY"
+check_equal "e2e quick start: the secret file is mode 600" "-rw-------" "$(ls -l "$E2E_SECRET_FILE" | cut -c1-10)"
+check_equal "e2e quick start: the key file is mode 600" "-rw-------" "$(ls -l "$E2E_KEY_FILE" | cut -c1-10)"
+check_equal "e2e quick start: serve received the session secret" "secret=$E2E_SECRET" "$(sed -n 1p "$E2E_OUT/serve-env")"
+check_equal "e2e quick start: serve received the signing key" "$E2E_KEY" "$(sed -n '2,$p' "$E2E_OUT/serve-env" | sed '1s/^jwt=//')"
+check_file_has "e2e quick start: the displayed command reads the secret from its file" "$TMP/out-plain" "INFLUXDB3_WEBUI_SESSION_SECRET=\"\$(cat '$E2E_SECRET_FILE')\""
+check_file_has "e2e quick start: the displayed command has the UI flags" "$TMP/out-plain" "$E2E_UI_FLAGS"
+check_file_lacks "e2e quick start: the secret value is not printed" "$TMP/out-plain" "$E2E_SECRET"
+check_file_lacks "e2e quick start: the key value is not printed" "$TMP/out-plain" "BEGIN RSA PRIVATE KEY"
+check_file_has "e2e quick start: the server came up" "$TMP/out-plain" "is now installed and running on port 8181"
+check_file_has "e2e quick start: one request to /" "$SHIM_LOG" "curl -sf --max-time 5 -o /dev/null http://localhost:8181/"
+check_file_has "e2e quick start: UI served line" "$TMP/out-plain" "Explorer is served by InfluxDB on port 8181"
+check_file_has "e2e quick start: browser opened" "$SHIM_LOG" "open http://localhost:8181"
+check_file_has "e2e quick start: next steps open the UI" "$TMP/out-plain" "Open Explorer UI: http://localhost:8181"
+check_file_has "e2e quick start: first-user note" "$TMP/out-plain" "influxdb3 create user --host http://localhost:8181 --username admin --role Admin --require-password-reset"
+check_file_lacks "e2e quick start: no external Explorer banner" "$TMP/out-plain" "Get InfluxDB 3 Explorer at"
+check_file_lacks "e2e quick start: no admin token hint" "$TMP/out-plain" "influxdb3 create token --admin"
+
+# Re-run in the same HOME: both secrets are reused, nothing is printed again
+printf '2\n1\n' | run_installer enterprise --version 3.12.0; RC=$?
+check_equal "e2e re-run: exit 0" 0 "$RC"
+check_equal "e2e re-run: the session secret is kept" "$E2E_SECRET" "$(cat "$E2E_SECRET_FILE")"
+check_equal "e2e re-run: the signing key is kept" "$E2E_KEY" "$(cat "$E2E_KEY_FILE")"
+check_equal "e2e re-run: serve received the same secret" "secret=$E2E_SECRET" "$(sed -n 1p "$E2E_OUT/serve-env")"
+check_file_lacks "e2e re-run: no warning" "$TMP/out-plain" "Warning:"
+check_file_has "e2e re-run: browser opened" "$SHIM_LOG" "open http://localhost:8181"
+
+# Skip startup: the secrets exist, the manual command is shown, nothing runs
+rm -rf "$E2E_HOME"
+printf '2\n3\n' | run_installer enterprise --version 3.12.0; RC=$?
+check_equal "e2e skip: exit 0" 0 "$RC"
+if [ -e "$E2E_OUT/serve-args" ]; then fail "e2e skip: the server must not start"; else pass; fi
+check_status "e2e skip: a session secret file was created" 0 is_session_secret "$(cat "$E2E_SECRET_FILE" 2>/dev/null)"
+check_status "e2e skip: a signing key file was created" 0 is_jwt_private_key "$(cat "$E2E_KEY_FILE" 2>/dev/null)"
+check_file_has "e2e skip: installed line" "$TMP/out-plain" "is now installed. Nice!"
+check_file_has "e2e skip: manual command reads the key from its file" "$TMP/out-plain" "INFLUXDB3_JWT_PRIVATE_KEY=\"\$(cat '$E2E_KEY_FILE')\""
+check_file_has "e2e skip: manual command has the UI flags" "$TMP/out-plain" "$E2E_UI_FLAGS"
+check_file_has "e2e skip: UI hint once running" "$TMP/out-plain" "Open Explorer UI: http://localhost:8181 once the server is running"
+check_file_has "e2e skip: first-user note" "$TMP/out-plain" "influxdb3 create user --host http://localhost:8181"
+check_file_lacks "e2e skip: no UI check" "$SHIM_LOG" "--max-time 5 -o /dev/null http://localhost:8181/"
+check_file_lacks "e2e skip: no browser" "$SHIM_LOG" "open "
+check_file_lacks "e2e skip: no external Explorer banner" "$TMP/out-plain" "Get InfluxDB 3 Explorer at"
+
+# Custom Configuration with a new trial license and file storage
+rm -rf "$E2E_HOME"
+printf '2\n2\ncluster0\nnode0\n1\nuser@example.com\n1\n\n' | run_installer enterprise --version 3.12.0; RC=$?
+check_equal "e2e custom: exit 0" 0 "$RC"
+check_file_has "e2e custom: serve has the license flags" "$E2E_OUT/serve-args" "--license-type=trial --license-email=user@example.com"
+check_file_has "e2e custom: serve has the UI flags after the license flags" "$E2E_OUT/serve-args" "--license-email=user@example.com $E2E_UI_FLAGS --http-bind=0.0.0.0:8181"
+check_equal "e2e custom: serve received the session secret" "secret=$(cat "$E2E_SECRET_FILE")" "$(sed -n 1p "$E2E_OUT/serve-env")"
+check_file_has "e2e custom: the displayed custom command has the UI flags" "$TMP/out-plain" "--mode='all,webui' --user-auth-type='basic' --jwt-key-id='install-script'"
+check_file_has "e2e custom: UI served line" "$TMP/out-plain" "Explorer is served by InfluxDB on port 8181"
+check_file_has "e2e custom: browser opened" "$SHIM_LOG" "open http://localhost:8181"
+
+# The server dies at startup: troubleshooting output, no UI check, no browser
+rm -rf "$E2E_HOME"
+mkdir -p "$E2E_HOME/.influxdb/data/cluster0"
+: > "$E2E_HOME/.influxdb/data/cluster0/trial_or_home_license"
+E2E_SERVE=die
+printf '2\n1\n' | run_installer enterprise --version 3.12.0; RC=$?
+E2E_SERVE=ok
+check_equal "e2e failed start: exit 0" 0 "$RC"
+check_file_has "e2e failed start: serve was started with the UI flags" "$E2E_OUT/serve-args" "$E2E_UI_FLAGS"
+check_file_has "e2e failed start: troubleshooting shown" "$TMP/out-plain" "Server startup failed"
+check_file_has "e2e failed start: manual command reads the secret from its file" "$TMP/out-plain" "INFLUXDB3_WEBUI_SESSION_SECRET=\"\$(cat '$E2E_SECRET_FILE')\""
+check_file_has "e2e failed start: UI hint once running" "$TMP/out-plain" "Open Explorer UI: http://localhost:8181 once the server is running"
+check_file_lacks "e2e failed start: no UI check" "$SHIM_LOG" "--max-time 5 -o /dev/null http://localhost:8181/"
+check_file_lacks "e2e failed start: no browser" "$SHIM_LOG" "open "
+check_file_lacks "e2e failed start: no served line" "$TMP/out-plain" "Explorer is served by InfluxDB"
+check_file_has "e2e failed start: first-user note" "$TMP/out-plain" "influxdb3 create user --host http://localhost:8181 --username admin --role Admin --require-password-reset"
+
+# The server is up but / does not answer: wording only, no browser
+SHIM_SMOKE=fail
+printf '2\n1\n' | run_installer enterprise --version 3.12.0; RC=$?
+SHIM_SMOKE=ok
+check_equal "e2e UI down: exit 0" 0 "$RC"
+check_file_has "e2e UI down: did-not-respond line" "$TMP/out-plain" "Explorer did not respond at http://localhost:8181/"
+check_file_has "e2e UI down: log hint" "$TMP/out-plain" "If the page does not load, check the log:"
+check_file_has "e2e UI down: next steps still open the UI" "$TMP/out-plain" "Open Explorer UI: http://localhost:8181"
+check_file_lacks "e2e UI down: no browser" "$SHIM_LOG" "open "
+
+# Enterprise 3.11.7: no embedded UI, nothing created, the external Explorer banner
+rm -rf "$E2E_HOME"
+mkdir -p "$E2E_HOME/.influxdb/data/cluster0"
+: > "$E2E_HOME/.influxdb/data/cluster0/trial_or_home_license"
+printf '2\n1\n' | run_installer enterprise --version 3.11.7; RC=$?
+check_equal "e2e 3.11.7: exit 0" 0 "$RC"
+check_file_lacks "e2e 3.11.7: serve has no UI flags" "$E2E_OUT/serve-args" "webui"
+check_equal "e2e 3.11.7: serve received no secrets" "secret=unset
+jwt=unset" "$(cat "$E2E_OUT/serve-env")"
+if [ -e "$E2E_SECRET_FILE" ] || [ -e "$E2E_KEY_FILE" ]; then fail "e2e 3.11.7: no secret files must be created"; else pass; fi
+check_file_has "e2e 3.11.7: the server came up" "$TMP/out-plain" "is now installed and running on port 8181"
+check_file_has "e2e 3.11.7: external Explorer banner" "$TMP/out-plain" "Get InfluxDB 3 Explorer at"
+check_file_has "e2e 3.11.7: admin token hint" "$TMP/out-plain" "influxdb3 create token --admin"
+check_file_lacks "e2e 3.11.7: no Open Explorer UI line" "$TMP/out-plain" "Open Explorer UI"
+check_file_lacks "e2e 3.11.7: no UI check" "$SHIM_LOG" "--max-time 5 -o /dev/null http://localhost:8181/"
+check_file_lacks "e2e 3.11.7: no browser" "$SHIM_LOG" "open "
+
+# Core 3.12.0 Quick Start: unchanged by the Enterprise feature
+rm -rf "$E2E_HOME"
+printf '2\n1\n' | run_installer --version 3.12.0; RC=$?
+check_equal "e2e core: exit 0" 0 "$RC"
+check_file_lacks "e2e core: serve has no UI flags" "$E2E_OUT/serve-args" "webui"
+check_file_lacks "e2e core: serve has no cluster id" "$E2E_OUT/serve-args" "cluster-id"
+if [ -e "$E2E_SECRET_FILE" ] || [ -e "$E2E_KEY_FILE" ]; then fail "e2e core: no secret files must be created"; else pass; fi
+check_file_has "e2e core: external Explorer banner" "$TMP/out-plain" "Get InfluxDB 3 Explorer at"
+check_file_lacks "e2e core: no browser" "$SHIM_LOG" "open "
+fi
 
 PATH="$ORIG_PATH"
 export PATH
