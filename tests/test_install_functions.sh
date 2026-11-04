@@ -878,8 +878,9 @@ check_file_lacks "e2e core start failure: browser not opened" "$SHIM_LOG" "open 
 # to uid 1500: Explorer is not started and the config is left alone. A mode
 # cannot stand in for the owner here, because the installer sets the mode
 # again on every run, so the check itself is replaced by one that fails;
-# the check is covered above. The server is not asked for a token on any
-# of these runs, because the token could not be stored.
+# the check is covered above. The server is not asked for a token while
+# the check fails, because the token could not be stored; the plain re-run
+# at the end of this block asks for one and stores it.
 reset_shims new ok ok
 (
     explorer_dirs_usable() { EXPLORER_UNUSABLE_PATH="$1/explorer/db"; return 1; }
