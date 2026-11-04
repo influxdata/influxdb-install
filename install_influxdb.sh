@@ -1777,10 +1777,16 @@ setup_docker_compose() {
         # Pull Explorer image
         pull_docker_image "influxdb3-explorer" "InfluxDB 3 Explorer" "false"
 
-        # Configure Explorer with placeholder token
-        configure_explorer_via_file "YOUR_TOKEN_HERE" "http://${CONTAINER_NAME}:8181" "$SERVER_NAME" "$DOCKER_DIR"
+        if explorer_dirs_usable "$DOCKER_DIR"; then
+            # Configure Explorer with placeholder token
+            configure_explorer_via_file "YOUR_TOKEN_HERE" "http://${CONTAINER_NAME}:8181" "$SERVER_NAME" "$DOCKER_DIR"
 
-        printf "└─ Explorer prepared (manual token configuration required)\n\n"
+            printf "└─ Explorer prepared (manual token configuration required)\n\n"
+        else
+            # The manual start would fail the same way; say so instead
+            EXPLORER_DIRS_UNUSABLE=true
+            printf "└─ ${YELLOW}Warning: cannot write to %s; Explorer not prepared${NC}\n\n" "$EXPLORER_UNUSABLE_PATH"
+        fi
     fi
 
     # Display success message and access points AFTER Explorer launch

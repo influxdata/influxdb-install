@@ -728,12 +728,17 @@ check_file_has "root: database directory given to the image user" "$SHIM_LOG" "c
 configure_explorer_via_file "$TOKEN_FIXTURE" "http://influxdb3-core:8181" "Core" "$ROOT_DIR" > /dev/null
 check_file_has "root: config file given to the image user" "$SHIM_LOG" "chown 1500:1500 $ROOT_DIR/explorer/config/config.json"
 check_status "root: directories count as usable" 0 explorer_dirs_usable "$ROOT_DIR"
-SHIM_UID=""
+# A non-root uid through the same shims: the chown shim logs every call,
+# so the guards on both chown calls are what keep the log empty
+SHIM_UID=1000
 reset_shims new ok ok
+create_docker_directories "$ROOT_DIR" false
 generate_docker_compose_yaml core "$ROOT_DIR" "" false
+configure_explorer_via_file "$TOKEN_FIXTURE" "http://influxdb3-core:8181" "Core" "$ROOT_DIR" > /dev/null
 sed -n '/^  influxdb3-explorer:/,$p' "$ROOT_DIR/docker-compose.yml" > "$TMP/explorer-block"
-check_file_has "non-root again: Explorer user line is back" "$TMP/explorer-block" "user: \"$(id -u):$(id -g)\""
+check_file_has "non-root again: Explorer user line is back" "$TMP/explorer-block" 'user: "1000:1000"'
 check_file_lacks "non-root again: no chown" "$SHIM_LOG" "chown"
+SHIM_UID=""
 
 # --- setup_docker_compose end to end with the shims ---
 # The production sequence: a fresh embedded run, a re-run, and a Core run in
@@ -887,6 +892,24 @@ check_file_has "e2e core unusable dir: chown step" "$TMP/out" "sudo chown -R $(i
 check_file_has "e2e core unusable dir: re-run step" "$TMP/out" "Run this installer again."
 check_file_lacks "e2e core unusable dir: no placeholder step" "$TMP/out" "YOUR_TOKEN_HERE"
 check_file_has "e2e core unusable dir: config kept" "$E2E_DIR/explorer/config/config.json" "$TOKEN_FIXTURE"
+
+# The same directory on the placeholder path: the config holds the
+# placeholder and the server already has a token, so no start step may
+# be offered, and the config is not written again
+printf '{\n  "DEFAULT_API_TOKEN": "YOUR_TOKEN_HERE",\n  "MARKER": "kept"\n}\n' > "$E2E_DIR/explorer/config/config.json"
+reset_shims conflict ok ok
+(
+    explorer_dirs_usable() { EXPLORER_UNUSABLE_PATH="$1/explorer/db"; return 1; }
+    run_setup core "$E2E_DIR" "" ""
+); RC=$?
+check_equal "e2e core unusable dir, placeholder: returns 0" 0 "$RC"
+check_file_has "e2e core unusable dir, placeholder: warning" "$TMP/out" "Warning: cannot write to $E2E_DIR/explorer/db; Explorer not prepared"
+check_file_has "e2e core unusable dir, placeholder: chown step" "$TMP/out" "sudo chown -R $(id -u):$(id -g) $E2E_DIR/explorer"
+check_file_has "e2e core unusable dir, placeholder: re-run step" "$TMP/out" "Run this installer again."
+check_file_lacks "e2e core unusable dir, placeholder: no start step" "$TMP/out" "docker compose up -d influxdb3-explorer"
+check_file_lacks "e2e core unusable dir, placeholder: no replace step" "$TMP/out" "YOUR_TOKEN_HERE"
+check_file_lacks "e2e core unusable dir, placeholder: Explorer not started" "$SHIM_LOG" "compose up -d influxdb3-explorer"
+check_file_has "e2e core unusable dir, placeholder: config not written again" "$E2E_DIR/explorer/config/config.json" '"MARKER": "kept"'
 
 # Back to Enterprise 3.12.1: still nothing to create
 EDITION="Enterprise"; INFLUXDB_VERSION="3.12.1"; DOCKER_IMAGE="influxdb:3.12.1-enterprise"
