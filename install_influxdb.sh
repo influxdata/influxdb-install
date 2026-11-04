@@ -1709,30 +1709,40 @@ setup_docker_compose() {
     EXPLORER_DIRS_UNUSABLE=false
     EXPLORER_START_FAILED=false
 
+    TOKEN=""
     if [ -f "$CONFIG_FILE" ]; then
         printf "└─ Found existing Explorer config\n\n"
         # The helper returns 1 when there is no usable token; guard it so -e
         # does not stop the script before Explorer is launched
         TOKEN=$(extract_token_from_explorer_config "$DOCKER_DIR") || TOKEN=""
+    fi
 
-        if [ -n "$TOKEN" ]; then
-            TOKEN_IS_NEW=false
-        else
+    # The directories are checked before the server is asked for a token:
+    # the server issues the operator token once, and a token the installer
+    # cannot store would be lost. A token the config already holds was read
+    # above and is kept. On the re-run after the chown, the config is still
+    # missing or holds the placeholder, so the token is created and stored
+    # then.
+    if ! explorer_dirs_usable "$DOCKER_DIR"; then
+        EXPLORER_DIRS_UNUSABLE=true
+        printf "└─ ${YELLOW}Warning: cannot write to %s; Explorer not set up${NC}\n\n" "$EXPLORER_UNUSABLE_PATH"
+    elif [ -z "$TOKEN" ]; then
+        if [ -f "$CONFIG_FILE" ]; then
             printf "   ${YELLOW}Config exists but no valid token found${NC}\n"
             printf "   Creating new operator token\n"
-            TOKEN=$(create_operator_token "$CONTAINER_NAME")
-            TOKEN_IS_NEW=true
-            printf "\n"
+        else
+            printf "└─ Creating operator token\n"
         fi
-    else
-        printf "└─ Creating operator token\n"
         TOKEN=$(create_operator_token "$CONTAINER_NAME")
         TOKEN_IS_NEW=true
         printf "\n"
     fi
 
     # Display token BEFORE launching Explorer (only if newly created)
-    if [ "$TOKEN" != "$MANUAL_TOKEN_MSG" ] && [ "$TOKEN" != "TOKEN_ALREADY_EXISTS" ]; then
+    if [ "$EXPLORER_DIRS_UNUSABLE" = true ]; then
+        # Nothing to set up: the summary prints the chown and re-run steps
+        :
+    elif [ "$TOKEN" != "$MANUAL_TOKEN_MSG" ] && [ "$TOKEN" != "TOKEN_ALREADY_EXISTS" ]; then
         # Decided here: configure_explorer_via_file reuses TOKEN for its
         # argument, so the value is the placeholder on the other branch
         EXPLORER_TOKEN_KNOWN=true
@@ -1746,29 +1756,23 @@ setup_docker_compose() {
         # Pull Explorer image
         pull_docker_image "influxdb3-explorer" "InfluxDB 3 Explorer" "false"
 
-        if explorer_dirs_usable "$DOCKER_DIR"; then
-            # Configure Explorer (use port 8181 for container-to-container communication)
-            configure_explorer_via_file "$TOKEN" "http://${CONTAINER_NAME}:8181" "$SERVER_NAME" "$DOCKER_DIR"
+        # Configure Explorer (use port 8181 for container-to-container communication)
+        configure_explorer_via_file "$TOKEN" "http://${CONTAINER_NAME}:8181" "$SERVER_NAME" "$DOCKER_DIR"
 
-            # A pipeline into the filter would report the filter's status;
-            # keep compose's own, so a container that never started is not
-            # waited for
-            UP_STATUS=0
-            UP_OUTPUT=$(docker compose up -d influxdb3-explorer 2>&1) || UP_STATUS=$?
-            if [ -n "$UP_OUTPUT" ]; then
-                printf '%s\n' "$UP_OUTPUT" | filter_docker_output
-            fi
+        # A pipeline into the filter would report the filter's status; keep
+        # compose's own, so a container that never started is not waited for
+        UP_STATUS=0
+        UP_OUTPUT=$(docker compose up -d influxdb3-explorer 2>&1) || UP_STATUS=$?
+        if [ -n "$UP_OUTPUT" ]; then
+            printf '%s\n' "$UP_OUTPUT" | filter_docker_output
+        fi
 
-            if [ "$UP_STATUS" -ne 0 ]; then
-                EXPLORER_START_FAILED=true
-                printf "└─ ${YELLOW}Warning: the Explorer container did not start${NC}\n"
-            elif wait_for_explorer_ready 60; then
-                EXPLORER_DEPLOYED=true
-                open_browser_url "http://localhost:${EXPLORER_PORT}/system-overview"
-            fi
-        else
-            EXPLORER_DIRS_UNUSABLE=true
-            printf "└─ ${YELLOW}Warning: cannot write to %s; Explorer not started${NC}\n" "$EXPLORER_UNUSABLE_PATH"
+        if [ "$UP_STATUS" -ne 0 ]; then
+            EXPLORER_START_FAILED=true
+            printf "└─ ${YELLOW}Warning: the Explorer container did not start${NC}\n"
+        elif wait_for_explorer_ready 60; then
+            EXPLORER_DEPLOYED=true
+            open_browser_url "http://localhost:${EXPLORER_PORT}/system-overview"
         fi
     else
         # Token creation failed - prepare Explorer but don't start it
@@ -1777,16 +1781,10 @@ setup_docker_compose() {
         # Pull Explorer image
         pull_docker_image "influxdb3-explorer" "InfluxDB 3 Explorer" "false"
 
-        if explorer_dirs_usable "$DOCKER_DIR"; then
-            # Configure Explorer with placeholder token
-            configure_explorer_via_file "YOUR_TOKEN_HERE" "http://${CONTAINER_NAME}:8181" "$SERVER_NAME" "$DOCKER_DIR"
+        # Configure Explorer with placeholder token
+        configure_explorer_via_file "YOUR_TOKEN_HERE" "http://${CONTAINER_NAME}:8181" "$SERVER_NAME" "$DOCKER_DIR"
 
-            printf "└─ Explorer prepared (manual token configuration required)\n\n"
-        else
-            # The manual start would fail the same way; say so instead
-            EXPLORER_DIRS_UNUSABLE=true
-            printf "└─ ${YELLOW}Warning: cannot write to %s; Explorer not prepared${NC}\n\n" "$EXPLORER_UNUSABLE_PATH"
-        fi
+        printf "└─ Explorer prepared (manual token configuration required)\n\n"
     fi
 
     # Display success message and access points AFTER Explorer launch
