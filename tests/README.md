@@ -10,9 +10,9 @@ shellcheck --severity=warning install_influxdb.sh tests/*.sh
 The helper tests replace Docker, HTTP and key generators with command shims.
 They cover OpenSSL and LibreSSL, host fallbacks, ssh-keygen and failure before startup.
 They also cover the Explorer container's user: the installing user in the
-compose file, a root install that keeps the image's own user and gives it
-the files, a database directory another user owns, and every outcome of
-the Explorer start: ready, not answering, and a container that did not start.
+compose file, root included, a database directory another user owns, and
+every outcome of the Explorer start: ready, not answering, and a container
+that did not start.
 They also cover the binary path's embedded UI helpers: the secret and key
 files, the version gate, the readiness check and the displayed commands.
 A final block runs the installer itself end to end on the binary path, with

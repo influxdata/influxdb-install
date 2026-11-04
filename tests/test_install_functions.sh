@@ -77,7 +77,6 @@ check_file_lacks() {
 BOLD=""; DIM=""; BLUE=""; NC=""; YELLOW=""; BOLDGREEN=""; RED=""
 MANUAL_TOKEN_MSG="MANUAL_TOKEN_CREATION_REQUIRED"
 FIRST_EXPLORER_USER="admin"
-EXPLORER_IMAGE_UID=1500
 # generate_session_secret picks shasum or sha256sum from OS, as the script does
 case "$(uname -s)" in
     Darwin*) OS="Darwin" ;;
@@ -340,8 +339,8 @@ create_docker_directories "$HOME/.influxdb/docker"
 if [ -d "$HOME/.influxdb/docker/explorer/db" ]; then pass; else fail "default: explorer/db created when \$2 is omitted"; fi
 
 # --- explorer_dirs_usable ---
-# Modes stand in for a directory another user owns; root ignores both, so
-# these checks need a normal user
+# Modes stand in for a directory another user owns; root passes any mode,
+# so these checks need a normal user
 if [ "$(id -u)" -ne 0 ]; then
     USABLE_DIR="$TMP/usable"
     create_docker_directories "$USABLE_DIR" false
@@ -465,8 +464,7 @@ cat > "$SHIM_BIN/open" <<'STUB'
 #!/bin/sh
 printf 'open %s\n' "$*" >> "$SHIM_LOG"
 STUB
-# id and chown are real unless SHIM_UID is set, which makes the functions
-# see that user; chown then only logs, because the tests do not run as root
+# id is real unless SHIM_UID is set, which makes the functions see that user
 cat > "$SHIM_BIN/id" <<'STUB'
 #!/bin/sh
 if [ -n "${SHIM_UID:-}" ]; then
@@ -478,17 +476,7 @@ PATH="$ORIG_PATH"
 export PATH
 exec id "$@"
 STUB
-cat > "$SHIM_BIN/chown" <<'STUB'
-#!/bin/sh
-if [ -n "${SHIM_UID:-}" ]; then
-    printf 'chown %s\n' "$*" >> "$SHIM_LOG"
-    exit 0
-fi
-PATH="$ORIG_PATH"
-export PATH
-exec chown "$@"
-STUB
-chmod +x "$SHIM_BIN/curl" "$SHIM_BIN/docker" "$SHIM_BIN/open" "$SHIM_BIN/id" "$SHIM_BIN/chown"
+chmod +x "$SHIM_BIN/curl" "$SHIM_BIN/docker" "$SHIM_BIN/open" "$SHIM_BIN/id"
 cp "$SHIM_BIN/open" "$SHIM_BIN/xdg-open"
 PATH="$SHIM_BIN:$ORIG_PATH"
 export PATH
@@ -711,10 +699,9 @@ else
     check_file_has "finish record failure: browser opened" "$SHIM_LOG" "open http://localhost:8181"
 fi
 
-# --- Root install: the Explorer container keeps the image's own user ---
-# The installer does not refuse root. The compose file then has no user:
-# line for Explorer, so the service never runs as uid 0, and the database
-# directory and the config file go to uid 1500 instead
+# --- Root install: Explorer gets the same user line as the server ---
+# The installer does not refuse root, and neither service is treated
+# specially: both run as the installing user, uid 0 included
 ROOT_DIR="$TMP/compose-root"
 SHIM_UID=0
 reset_shims new ok ok
@@ -722,22 +709,8 @@ create_docker_directories "$ROOT_DIR" false
 DOCKER_IMAGE="influxdb:3.12.1-core"
 generate_docker_compose_yaml core "$ROOT_DIR" "" false
 sed -n '/^  influxdb3-explorer:/,$p' "$ROOT_DIR/docker-compose.yml" > "$TMP/explorer-block"
-check_file_lacks "root: Explorer has no user line" "$TMP/explorer-block" "user:"
-check_file_has "root: Explorer service still present" "$TMP/explorer-block" "image: influxdata/influxdb3-ui"
-check_file_has "root: database directory given to the image user" "$SHIM_LOG" "chown -R 1500:1500 $ROOT_DIR/explorer/db"
-configure_explorer_via_file "$TOKEN_FIXTURE" "http://influxdb3-core:8181" "Core" "$ROOT_DIR" > /dev/null
-check_file_has "root: config file given to the image user" "$SHIM_LOG" "chown 1500:1500 $ROOT_DIR/explorer/config/config.json"
-check_status "root: directories count as usable" 0 explorer_dirs_usable "$ROOT_DIR"
-# A non-root uid through the same shims: the chown shim logs every call,
-# so the guards on both chown calls are what keep the log empty
-SHIM_UID=1000
-reset_shims new ok ok
-create_docker_directories "$ROOT_DIR" false
-generate_docker_compose_yaml core "$ROOT_DIR" "" false
-configure_explorer_via_file "$TOKEN_FIXTURE" "http://influxdb3-core:8181" "Core" "$ROOT_DIR" > /dev/null
-sed -n '/^  influxdb3-explorer:/,$p' "$ROOT_DIR/docker-compose.yml" > "$TMP/explorer-block"
-check_file_has "non-root again: Explorer user line is back" "$TMP/explorer-block" 'user: "1000:1000"'
-check_file_lacks "non-root again: no chown" "$SHIM_LOG" "chown"
+check_file_has "root: Explorer runs as root like the server" "$TMP/explorer-block" 'user: "0:0"'
+check_equal "root: both services carry the user line" 2 "$(grep -c 'user: "0:0"' "$ROOT_DIR/docker-compose.yml")"
 SHIM_UID=""
 
 # --- setup_docker_compose end to end with the shims ---

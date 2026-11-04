@@ -220,7 +220,6 @@ readonly NC='\033[0m' # No Color
 INFLUXDB_PORT=8181  # Can be changed if port is in use
 EXPLORER_PORT=8888  # Can be changed if port is in use
 readonly EXPLORER_IMAGE="influxdata/influxdb3-ui"
-readonly EXPLORER_IMAGE_UID=1500  # the image's own user, influxui; a root install keeps it
 readonly MANUAL_TOKEN_MSG="MANUAL_TOKEN_CREATION_REQUIRED"
 readonly FIRST_EXPLORER_USER="admin"  # the admin the embedded-UI path creates
 
@@ -842,29 +841,17 @@ create_docker_directories() {
 
     chmod 700 "$DOCKER_DIR/explorer/db" 2>/dev/null || true
     chmod 750 "$DOCKER_DIR/explorer/config" 2>/dev/null || true
-
-    # Root keeps the image's own user for the Explorer container (see
-    # generate_docker_compose_yaml), so that user must own the database
-    # directory; -R also repairs files an earlier run left to root
-    if [ "$(id -u)" -eq 0 ]; then
-        chown -R "$EXPLORER_IMAGE_UID:$EXPLORER_IMAGE_UID" "$DOCKER_DIR/explorer/db" 2>/dev/null || true
-    fi
 }
 
 # Checks that the installing user can use the Explorer directories. The
 # container runs as that user (see generate_docker_compose_yaml), so a
 # directory another user owns, for example after the documented
 # "chown -R 1500:1500" for the image's own user, stops Explorer with
-# "Permission denied". Root is exempt: it keeps the image's user and gives
-# it the files. Returns 1 and names the first unusable path in
+# "Permission denied". Returns 1 and names the first unusable path in
 # EXPLORER_UNUSABLE_PATH.
 explorer_dirs_usable() {
     DOCKER_DIR="$1"
     EXPLORER_UNUSABLE_PATH=""
-
-    if [ "$(id -u)" -eq 0 ]; then
-        return 0
-    fi
 
     for DIR_PATH in "$DOCKER_DIR/explorer/db" "$DOCKER_DIR/explorer/config"; do
         if ! [ -r "$DIR_PATH" ] || ! [ -w "$DIR_PATH" ] || ! [ -x "$DIR_PATH" ]; then
@@ -1052,18 +1039,6 @@ generate_docker_compose_yaml() {
     USER_UID=$(id -u)
     USER_GID=$(id -g)
 
-    # The Explorer container runs as the installing user, who owns the host
-    # directories it mounts, so the file modes that keep the token private
-    # also let the container read its config and write its database. Root is
-    # the exception: the container keeps the image's own user, and
-    # create_docker_directories and configure_explorer_via_file give it the
-    # files instead, so the service never runs as uid 0.
-    EXPLORER_USER_LINE=""
-    if [ "$USER_UID" -ne 0 ]; then
-        EXPLORER_USER_LINE="
-    user: \"${USER_UID}:${USER_GID}\""
-    fi
-
     # Determine edition-specific values
     if [ "$EDITION_TYPE" = "enterprise" ]; then
         SERVICE_NAME="influxdb3-enterprise"
@@ -1111,7 +1086,8 @@ generate_docker_compose_yaml() {
         EXPLORER_SERVICE="
   influxdb3-explorer:
     image: ${EXPLORER_IMAGE}
-    container_name: influxdb3-explorer${EXPLORER_USER_LINE}
+    container_name: influxdb3-explorer
+    user: \"${USER_UID}:${USER_GID}\"
     command: [\"--mode=admin\"]
     ports:
       - \"${EXPLORER_PORT}:8080\"
@@ -1307,12 +1283,6 @@ configure_explorer_via_file() {
 EOF
 
     chmod 640 "$DOCKER_DIR/explorer/config/config.json"
-
-    # Root keeps the image's own user for the container, which must then
-    # read this file; see generate_docker_compose_yaml
-    if [ "$(id -u)" -eq 0 ]; then
-        chown "$EXPLORER_IMAGE_UID:$EXPLORER_IMAGE_UID" "$DOCKER_DIR/explorer/config/config.json" 2>/dev/null || true
-    fi
 
     return 0
 }
