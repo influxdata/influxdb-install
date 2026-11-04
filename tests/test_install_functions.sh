@@ -888,6 +888,7 @@ reset_shims new ok ok
 check_equal "e2e core unusable dir: returns 0" 0 "$RC"
 check_file_has "e2e core unusable dir: existing config read" "$TMP/out" "Found existing Explorer config"
 check_file_has "e2e core unusable dir: warning" "$TMP/out" "Warning: cannot write to $E2E_DIR/explorer/db; Explorer not set up"
+check_file_has "e2e core unusable dir: server started, it is claimed" "$SHIM_LOG" "docker compose up -d influxdb3-core"
 check_file_lacks "e2e core unusable dir: no token requested" "$SHIM_LOG" "configure/token/admin"
 check_file_lacks "e2e core unusable dir: no token box" "$TMP/out" "OPERATOR TOKEN"
 check_file_lacks "e2e core unusable dir: Explorer image not pulled" "$SHIM_LOG" "compose pull influxdb3-explorer"
@@ -898,34 +899,38 @@ check_file_has "e2e core unusable dir: re-run step" "$TMP/out" "Run this install
 check_file_lacks "e2e core unusable dir: no placeholder step" "$TMP/out" "YOUR_TOKEN_HERE"
 check_file_has "e2e core unusable dir: config kept" "$E2E_DIR/explorer/config/config.json" "$TOKEN_FIXTURE"
 
-# The same directory with a placeholder in the config: the server would
-# issue a token, but it is not asked, and the config is not written again
+# The same directory with a placeholder in the config: a fresh server
+# would need a token at once, and it could not be stored, so nothing is
+# stopped or started, and the config is not written again
 printf '{\n  "DEFAULT_API_TOKEN": "YOUR_TOKEN_HERE",\n  "MARKER": "kept"\n}\n' > "$E2E_DIR/explorer/config/config.json"
 reset_shims new ok ok
 (
     explorer_dirs_usable() { EXPLORER_UNUSABLE_PATH="$1/explorer/db"; return 1; }
     run_setup core "$E2E_DIR" "" ""
 ); RC=$?
-check_equal "e2e core unusable dir, placeholder: returns 0" 0 "$RC"
-check_file_has "e2e core unusable dir, placeholder: warning" "$TMP/out" "Warning: cannot write to $E2E_DIR/explorer/db; Explorer not set up"
+check_equal "e2e core unusable dir, placeholder: returns 1" 1 "$RC"
+check_file_has "e2e core unusable dir, placeholder: error" "$TMP/out" "Error: another user owns $E2E_DIR/explorer/db, so Explorer, which runs as your user, cannot use it"
+check_file_has "e2e core unusable dir, placeholder: nothing started" "$TMP/out" "Nothing was started."
+check_file_has "e2e core unusable dir, placeholder: chown step" "$TMP/out" "sudo chown -R $(id -u):$(id -g) $E2E_DIR/explorer"
+check_file_has "e2e core unusable dir, placeholder: re-run step" "$TMP/out" "Then run this installer again."
+check_file_lacks "e2e core unusable dir, placeholder: existing stack not stopped" "$SHIM_LOG" "docker compose down"
+check_file_lacks "e2e core unusable dir, placeholder: server not started" "$SHIM_LOG" "docker compose up"
 check_file_lacks "e2e core unusable dir, placeholder: no token requested" "$SHIM_LOG" "configure/token/admin"
 check_file_lacks "e2e core unusable dir, placeholder: no token box" "$TMP/out" "OPERATOR TOKEN"
-check_file_has "e2e core unusable dir, placeholder: chown step" "$TMP/out" "sudo chown -R $(id -u):$(id -g) $E2E_DIR/explorer"
-check_file_has "e2e core unusable dir, placeholder: re-run step" "$TMP/out" "Run this installer again."
-check_file_lacks "e2e core unusable dir, placeholder: no start step" "$TMP/out" "docker compose up -d influxdb3-explorer"
 check_file_lacks "e2e core unusable dir, placeholder: no replace step" "$TMP/out" "YOUR_TOKEN_HERE"
-check_file_lacks "e2e core unusable dir, placeholder: Explorer not started" "$SHIM_LOG" "compose up -d influxdb3-explorer"
+check_file_lacks "e2e core unusable dir, placeholder: no deployed line" "$TMP/out" "successfully deployed"
 check_file_has "e2e core unusable dir, placeholder: config not written again" "$E2E_DIR/explorer/config/config.json" '"MARKER": "kept"'
 
-# The same directory with no config at all: still no token request, and
-# the re-run after the chown creates and stores the token normally
+# The same directory with no config at all: the same stop, and the re-run
+# after the chown creates and stores the token normally
 rm "$E2E_DIR/explorer/config/config.json"
 reset_shims new ok ok
 (
     explorer_dirs_usable() { EXPLORER_UNUSABLE_PATH="$1/explorer/db"; return 1; }
     run_setup core "$E2E_DIR" "" ""
 ); RC=$?
-check_equal "e2e core unusable dir, no config: returns 0" 0 "$RC"
+check_equal "e2e core unusable dir, no config: returns 1" 1 "$RC"
+check_file_lacks "e2e core unusable dir, no config: server not started" "$SHIM_LOG" "docker compose up"
 check_file_lacks "e2e core unusable dir, no config: no token requested" "$SHIM_LOG" "configure/token/admin"
 check_file_lacks "e2e core unusable dir, no config: no token box" "$TMP/out" "OPERATOR TOKEN"
 check_file_has "e2e core unusable dir, no config: chown step" "$TMP/out" "sudo chown -R $(id -u):$(id -g) $E2E_DIR/explorer"

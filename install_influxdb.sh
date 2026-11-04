@@ -1606,6 +1606,35 @@ setup_docker_compose() {
     printf "├─ Creating directories\n"
     create_docker_directories "$DOCKER_DIR" "$USE_EMBEDDED_UI"
 
+    # Explorer container path: the directories are checked before anything
+    # is stopped or started. A fresh server must get its operator token
+    # right after it is ready (see setup_first_explorer_user), and a token
+    # the installer cannot store would be lost; so when the directories are
+    # unusable and the config holds no token, nothing starts. A token in the
+    # config means the server is claimed already: it starts, and only
+    # Explorer is skipped. The re-run after the chown creates and stores the
+    # token normally.
+    CONFIG_FILE="$DOCKER_DIR/explorer/config/config.json"
+    TOKEN=""
+    EXPLORER_DIRS_UNUSABLE=false
+    if [ "$USE_EMBEDDED_UI" != true ]; then
+        if [ -f "$CONFIG_FILE" ]; then
+            # The helper returns 1 when there is no usable token; guard it
+            # so -e does not stop the script here
+            TOKEN=$(extract_token_from_explorer_config "$DOCKER_DIR") || TOKEN=""
+        fi
+        if ! explorer_dirs_usable "$DOCKER_DIR"; then
+            EXPLORER_DIRS_UNUSABLE=true
+            if [ -z "$TOKEN" ]; then
+                printf "└─ ${RED}Error: another user owns %s, so Explorer, which runs as your user, cannot use it${NC}\n" "$EXPLORER_UNUSABLE_PATH"
+                printf "   Nothing was started. Give the Explorer directories back to your user:\n"
+                printf "   ${DIM}sudo chown -R %s:%s %s/explorer${NC}\n" "$(id -u)" "$(id -g)" "$DOCKER_DIR"
+                printf "   Then run this installer again.\n\n"
+                return 1
+            fi
+        fi
+    fi
+
     # Stop any existing containers before reconfiguring; the old file is
     # what removes an older layout's Explorer container
     if [ -f "$DOCKER_DIR/docker-compose.yml" ]; then
@@ -1701,30 +1730,20 @@ setup_docker_compose() {
         return 0
     fi
 
-    # Check for existing token in Explorer config, or create new one
-    CONFIG_FILE="$DOCKER_DIR/explorer/config/config.json"
+    # Use the existing token from the Explorer config, or create a new one.
+    # TOKEN and EXPLORER_DIRS_UNUSABLE were set before the server started.
     TOKEN_IS_NEW=false
     EXPLORER_DEPLOYED=false
     EXPLORER_TOKEN_KNOWN=false
-    EXPLORER_DIRS_UNUSABLE=false
     EXPLORER_START_FAILED=false
 
-    TOKEN=""
     if [ -f "$CONFIG_FILE" ]; then
         printf "└─ Found existing Explorer config\n\n"
-        # The helper returns 1 when there is no usable token; guard it so -e
-        # does not stop the script before Explorer is launched
-        TOKEN=$(extract_token_from_explorer_config "$DOCKER_DIR") || TOKEN=""
     fi
 
-    # The directories are checked before the server is asked for a token:
-    # the server issues the operator token once, and a token the installer
-    # cannot store would be lost. A token the config already holds was read
-    # above and is kept. On the re-run after the chown, the config is still
-    # missing or holds the placeholder, so the token is created and stored
-    # then.
-    if ! explorer_dirs_usable "$DOCKER_DIR"; then
-        EXPLORER_DIRS_UNUSABLE=true
+    if [ "$EXPLORER_DIRS_UNUSABLE" = true ]; then
+        # The config holds a token, so the server is claimed; only Explorer
+        # is skipped, and the summary prints the chown and re-run steps
         printf "└─ ${YELLOW}Warning: cannot write to %s; Explorer not set up${NC}\n\n" "$EXPLORER_UNUSABLE_PATH"
     elif [ -z "$TOKEN" ]; then
         if [ -f "$CONFIG_FILE" ]; then
