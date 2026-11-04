@@ -9,6 +9,31 @@ shellcheck --severity=warning install_influxdb.sh tests/*.sh
 
 The helper tests replace Docker, HTTP and key generators with command shims.
 They cover OpenSSL and LibreSSL, host fallbacks, ssh-keygen and failure before startup.
+They also cover the binary path's embedded UI helpers: the secret and key
+files, the version gate, the readiness check and the displayed commands.
+A final block runs the installer itself end to end on the binary path, with
+curl, the port probe, the browser opener and the downloaded binary replaced
+by shims: Quick Start, a re-run, Skip startup, Custom Configuration, a
+failed start, an unresponsive UI, Enterprise 3.11.7 and Core.
+The loader refuses a function name that the script defines twice, because
+the shell runs the last definition while the loader reads the first.
+
+## Real Enterprise binary
+
+Supply a license as above, then:
+
+```sh
+INFLUXDB3_TEST_LICENSE_FILE=/path/to/license.jwt python3 tests/test_binary_ui.py
+```
+
+The test downloads the release tarball for the host (`--binary PATH` reuses an
+extracted one) and extracts it only with Python's safe `data` tar filter, so it
+needs Python 3.12 or a patched 3.8+. It runs the installer's gate to create
+the session secret and the signing key with the host's openssl or ssh-keygen,
+and starts the binary with the installer's flags and environment. It creates the operator token and the
+first admin the way the installer's first-user note says, checks forced
+password reset, sign-in and access, then restarts the server and checks that
+both secrets and the existing JWT survive. It does not run in GitHub Actions.
 
 ## Real Enterprise image
 
