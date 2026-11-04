@@ -30,6 +30,7 @@ DOCKER_CONFIG="${DOCKER_CONFIG:-$HOME/.docker}"
 export DOCKER_CONFIG
 REAL_DOCKER=$(command -v docker 2>/dev/null) || REAL_DOCKER=""
 ORIG_PATH="$PATH"
+export ORIG_PATH
 
 SCRIPT=$(cd "$(dirname "$0")/.." && pwd)/install_influxdb.sh
 PASSED=0
@@ -76,6 +77,7 @@ check_file_lacks() {
 BOLD=""; DIM=""; BLUE=""; NC=""; YELLOW=""; BOLDGREEN=""; RED=""
 MANUAL_TOKEN_MSG="MANUAL_TOKEN_CREATION_REQUIRED"
 FIRST_EXPLORER_USER="admin"
+EXPLORER_IMAGE_UID=1500
 # generate_session_secret picks shasum or sha256sum from OS, as the script does
 case "$(uname -s)" in
     Darwin*) OS="Darwin" ;;
@@ -88,6 +90,8 @@ load_function is_session_secret
 load_function generate_session_secret
 load_function is_jwt_private_key
 load_function create_docker_directories
+load_function explorer_dirs_usable
+load_function configure_explorer_via_file
 load_function generate_docker_compose_yaml
 load_function write_env_file
 load_function read_env_value
@@ -288,6 +292,9 @@ check_file_has "explorer: Explorer port" "$COMPOSE" '"8888:8080"'
 check_file_has "explorer: Explorer session secret" "$COMPOSE" 'SESSION_SECRET_KEY=${SESSION_SECRET}'
 check_file_has "explorer: InfluxDB port published on all interfaces" "$COMPOSE" '- "8181:8181"'
 check_file_lacks "explorer: no webui mode" "$COMPOSE" "webui"
+# Scoped to the Explorer service: the server service has the same text
+sed -n '/^  influxdb3-explorer:/,$p' "$COMPOSE" > "$TMP/explorer-block"
+check_file_has "explorer: container runs as the installing user" "$TMP/explorer-block" "user: \"$(id -u):$(id -g)\""
 check_file_lacks "explorer: no user auth" "$COMPOSE" "user-auth-type"
 check_file_lacks "explorer: no JWT key" "$COMPOSE" "JWT_PRIVATE_KEY"
 
@@ -301,6 +308,8 @@ check_file_has "core: depends on the core service" "$COMPOSE" "- influxdb3-core"
 check_file_lacks "core: no cluster id" "$COMPOSE" "cluster-id"
 check_file_lacks "core: no license environment" "$COMPOSE" "INFLUXDB3_LICENSE"
 check_file_lacks "core: no webui mode" "$COMPOSE" "webui"
+sed -n '/^  influxdb3-explorer:/,$p' "$COMPOSE" > "$TMP/explorer-block"
+check_file_has "core: Explorer runs as the installing user" "$TMP/explorer-block" "user: \"$(id -u):$(id -g)\""
 
 # Compose must parse the multi-line double-quoted key in .env; skipped without Docker
 if [ -n "$REAL_DOCKER" ] && "$REAL_DOCKER" compose version >/dev/null 2>&1; then
@@ -329,6 +338,38 @@ if [ -d "$HOME/.influxdb/docker/explorer/db" ] && [ -d "$HOME/.influxdb/docker/e
 HOME="$TMP/home-default"
 create_docker_directories "$HOME/.influxdb/docker"
 if [ -d "$HOME/.influxdb/docker/explorer/db" ]; then pass; else fail "default: explorer/db created when \$2 is omitted"; fi
+
+# --- explorer_dirs_usable ---
+# Modes stand in for a directory another user owns; root ignores both, so
+# these checks need a normal user
+if [ "$(id -u)" -ne 0 ]; then
+    USABLE_DIR="$TMP/usable"
+    create_docker_directories "$USABLE_DIR" false
+    check_status "usable: fresh directories" 0 explorer_dirs_usable "$USABLE_DIR"
+    chmod 500 "$USABLE_DIR/explorer/db"
+    check_status "usable: a read-only database directory fails" 1 explorer_dirs_usable "$USABLE_DIR"
+    explorer_dirs_usable "$USABLE_DIR" || :
+    check_equal "usable: the database directory is named" "$USABLE_DIR/explorer/db" "$EXPLORER_UNUSABLE_PATH"
+    chmod 700 "$USABLE_DIR/explorer/db"
+    : > "$USABLE_DIR/explorer/db/sqlite.db"
+    chmod 400 "$USABLE_DIR/explorer/db/sqlite.db"
+    check_status "usable: a read-only database file fails" 1 explorer_dirs_usable "$USABLE_DIR"
+    explorer_dirs_usable "$USABLE_DIR" || :
+    check_equal "usable: the database file is named" "$USABLE_DIR/explorer/db/sqlite.db" "$EXPLORER_UNUSABLE_PATH"
+    chmod 600 "$USABLE_DIR/explorer/db/sqlite.db"
+    check_status "usable: a writable database file passes" 0 explorer_dirs_usable "$USABLE_DIR"
+    chmod 550 "$USABLE_DIR/explorer/config"
+    check_status "usable: a read-only config directory fails" 1 explorer_dirs_usable "$USABLE_DIR"
+    chmod 750 "$USABLE_DIR/explorer/config"
+    : > "$USABLE_DIR/explorer/config/config.json"
+    chmod 440 "$USABLE_DIR/explorer/config/config.json"
+    check_status "usable: a read-only config file fails" 1 explorer_dirs_usable "$USABLE_DIR"
+    chmod 640 "$USABLE_DIR/explorer/config/config.json"
+    check_status "usable: everything writable passes" 0 explorer_dirs_usable "$USABLE_DIR"
+    check_equal "usable: no path named on success" "" "$EXPLORER_UNUSABLE_PATH"
+else
+    printf 'skip: explorer_dirs_usable checks need a non-root user\n'
+fi
 
 # --- extract_token_from_explorer_config ---
 CFG_HOME="$TMP/cfg"
@@ -359,6 +400,10 @@ case "$*" in
             *) printf 'unavailable\n503\n' ;;
         esac
         ;;
+    *"/api/health"*)
+        # The Explorer container answers at once
+        printf '{"status":"ok"}\n'
+        ;;
     *)
         [ "${SHIM_SMOKE:-ok}" = ok ]
         ;;
@@ -376,6 +421,11 @@ case "$*" in
             other-exists) printf 'Create command failed: role admin already exists\n' >&2; exit 1 ;;
             *) printf 'Create command failed: unauthorized\n' >&2; exit 1 ;;
         esac
+        ;;
+    "compose up -d influxdb3-explorer")
+        if [ "${SHIM_UP:-ok}" = ok ]; then exit 0; fi
+        printf 'Error response from daemon: no such image: influxdata/influxdb3-ui\n' >&2
+        exit 1
         ;;
     "info"|"compose version"|"manifest inspect "*|"compose down"*|"compose pull "*|"compose up "*|"inspect "*)
         exit 0
@@ -415,13 +465,37 @@ cat > "$SHIM_BIN/open" <<'STUB'
 #!/bin/sh
 printf 'open %s\n' "$*" >> "$SHIM_LOG"
 STUB
-chmod +x "$SHIM_BIN/curl" "$SHIM_BIN/docker" "$SHIM_BIN/open"
+# id and chown are real unless SHIM_UID is set, which makes the functions
+# see that user; chown then only logs, because the tests do not run as root
+cat > "$SHIM_BIN/id" <<'STUB'
+#!/bin/sh
+if [ -n "${SHIM_UID:-}" ]; then
+    case "$*" in
+        -u|-g) printf '%s\n' "$SHIM_UID"; exit 0 ;;
+    esac
+fi
+PATH="$ORIG_PATH"
+export PATH
+exec id "$@"
+STUB
+cat > "$SHIM_BIN/chown" <<'STUB'
+#!/bin/sh
+if [ -n "${SHIM_UID:-}" ]; then
+    printf 'chown %s\n' "$*" >> "$SHIM_LOG"
+    exit 0
+fi
+PATH="$ORIG_PATH"
+export PATH
+exec chown "$@"
+STUB
+chmod +x "$SHIM_BIN/curl" "$SHIM_BIN/docker" "$SHIM_BIN/open" "$SHIM_BIN/id" "$SHIM_BIN/chown"
 cp "$SHIM_BIN/open" "$SHIM_BIN/xdg-open"
 PATH="$SHIM_BIN:$ORIG_PATH"
 export PATH
 SHIM_NEW_TOKEN="$TOKEN_FIXTURE"
 SHIM_PKCS1="$PKCS1"
-export SHIM_NEW_TOKEN SHIM_PKCS1 SHIM_TOKEN SHIM_SMOKE SHIM_CREATE
+SHIM_UP=ok
+export SHIM_NEW_TOKEN SHIM_PKCS1 SHIM_TOKEN SHIM_SMOKE SHIM_CREATE SHIM_UP SHIM_UID
 
 reset_shims() {
     # open_browser_url starts the opener in the background; let it finish
@@ -637,6 +711,30 @@ else
     check_file_has "finish record failure: browser opened" "$SHIM_LOG" "open http://localhost:8181"
 fi
 
+# --- Root install: the Explorer container keeps the image's own user ---
+# The installer does not refuse root. The compose file then has no user:
+# line for Explorer, so the service never runs as uid 0, and the database
+# directory and the config file go to uid 1500 instead
+ROOT_DIR="$TMP/compose-root"
+SHIM_UID=0
+reset_shims new ok ok
+create_docker_directories "$ROOT_DIR" false
+DOCKER_IMAGE="influxdb:3.12.1-core"
+generate_docker_compose_yaml core "$ROOT_DIR" "" false
+sed -n '/^  influxdb3-explorer:/,$p' "$ROOT_DIR/docker-compose.yml" > "$TMP/explorer-block"
+check_file_lacks "root: Explorer has no user line" "$TMP/explorer-block" "user:"
+check_file_has "root: Explorer service still present" "$TMP/explorer-block" "image: influxdata/influxdb3-ui"
+check_file_has "root: database directory given to the image user" "$SHIM_LOG" "chown -R 1500:1500 $ROOT_DIR/explorer/db"
+configure_explorer_via_file "$TOKEN_FIXTURE" "http://influxdb3-core:8181" "Core" "$ROOT_DIR" > /dev/null
+check_file_has "root: config file given to the image user" "$SHIM_LOG" "chown 1500:1500 $ROOT_DIR/explorer/config/config.json"
+check_status "root: directories count as usable" 0 explorer_dirs_usable "$ROOT_DIR"
+SHIM_UID=""
+reset_shims new ok ok
+generate_docker_compose_yaml core "$ROOT_DIR" "" false
+sed -n '/^  influxdb3-explorer:/,$p' "$ROOT_DIR/docker-compose.yml" > "$TMP/explorer-block"
+check_file_has "non-root again: Explorer user line is back" "$TMP/explorer-block" "user: \"$(id -u):$(id -g)\""
+check_file_lacks "non-root again: no chown" "$SHIM_LOG" "chown"
+
 # --- setup_docker_compose end to end with the shims ---
 # The production sequence: a fresh embedded run, a re-run, and a Core run in
 # between, each checked on the .env it leaves behind
@@ -727,6 +825,68 @@ check_equal "e2e core: session secret kept" "$E2E_SECRET" "$(read_env_value "$E2
 check_equal "e2e core: key kept for the next embedded run" "$PKCS1" "$(read_env_jwt_private_key "$E2E_DIR/.env")"
 check_equal "e2e core: user record kept for the next embedded run" "admin" "$(read_env_value "$E2E_DIR/.env" EXPLORER_USER)"
 check_file_lacks "e2e core: no email for Core" "$E2E_DIR/.env" "INFLUXDB_EMAIL"
+# The token exists but is not known, so Explorer is prepared, not started
+check_file_lacks "e2e core: Explorer not started" "$SHIM_LOG" "compose up -d influxdb3-explorer"
+check_file_has "e2e core: placeholder step shown" "$TMP/out" 'Replace "YOUR_TOKEN_HERE" with your admin token'
+check_file_lacks "e2e core: no timeout text" "$TMP/out" "did not respond"
+
+# The config holds the placeholder, so a token is created and Explorer is
+# started; the readiness wait is not loaded here, so it fails at once
+reset_shims new ok ok
+run_setup core "$E2E_DIR" "" ""; RC=$?
+check_equal "e2e core timeout: returns 0" 0 "$RC"
+check_file_has "e2e core timeout: token box" "$TMP/out" "OPERATOR TOKEN"
+check_file_has "e2e core timeout: Explorer started" "$SHIM_LOG" "docker compose up -d influxdb3-explorer"
+check_file_has "e2e core timeout: config holds the token" "$E2E_DIR/explorer/config/config.json" "$TOKEN_FIXTURE"
+check_file_has "e2e core timeout: timeout text" "$TMP/out" "Explorer did not respond within 60 seconds"
+check_file_has "e2e core timeout: status and logs step" "$TMP/out" "cd $E2E_DIR && docker compose ps influxdb3-explorer && docker compose logs influxdb3-explorer"
+check_file_lacks "e2e core timeout: no placeholder step" "$TMP/out" "YOUR_TOKEN_HERE"
+check_file_lacks "e2e core timeout: no Explorer access point" "$TMP/out" "Explorer UI:"
+check_file_lacks "e2e core timeout: browser not opened" "$SHIM_LOG" "open http://localhost:8888"
+
+# Explorer answers: the config keeps the token, the UI is opened
+reset_shims conflict ok ok
+(load_function wait_for_explorer_ready; run_setup core "$E2E_DIR" "" ""); RC=$?
+check_equal "e2e core ready: returns 0" 0 "$RC"
+check_file_has "e2e core ready: existing config used" "$TMP/out" "Found existing Explorer config"
+check_file_lacks "e2e core ready: no new token" "$TMP/out" "OPERATOR TOKEN"
+check_file_has "e2e core ready: deployed with Explorer" "$TMP/out" "with InfluxDB 3 Explorer successfully deployed"
+check_file_has "e2e core ready: Explorer access point" "$TMP/out" "Explorer UI:  http://localhost:8888"
+check_file_has "e2e core ready: browser opened" "$SHIM_LOG" "open http://localhost:8888/system-overview"
+check_file_lacks "e2e core ready: no manual steps" "$TMP/out" "To Complete InfluxDB 3 Explorer Setup"
+
+# compose cannot start the container: no 60-second wait, the error shows
+SHIM_UP=fail
+reset_shims conflict ok ok
+(load_function wait_for_explorer_ready; run_setup core "$E2E_DIR" "" ""); RC=$?
+SHIM_UP=ok
+check_equal "e2e core start failure: returns 0" 0 "$RC"
+check_file_has "e2e core start failure: compose error shown" "$TMP/out" "Error response from daemon: no such image"
+check_file_has "e2e core start failure: warning" "$TMP/out" "Warning: the Explorer container did not start"
+check_file_lacks "e2e core start failure: no readiness wait" "$TMP/out" "Starting Explorer"
+check_file_has "e2e core start failure: start step" "$TMP/out" "The Explorer container did not start."
+check_file_has "e2e core start failure: start command" "$TMP/out" "cd $E2E_DIR && docker compose up -d influxdb3-explorer"
+check_file_lacks "e2e core start failure: no timeout text" "$TMP/out" "did not respond"
+check_file_lacks "e2e core start failure: browser not opened" "$SHIM_LOG" "open http://localhost:8888"
+
+# Another user owns the database directory, as after the documented chown
+# to uid 1500: Explorer is not started and the config is left alone. A mode
+# cannot stand in for the owner here, because the installer sets the mode
+# again on every run, so the check itself is replaced by one that fails;
+# the check is covered above
+reset_shims conflict ok ok
+(
+    explorer_dirs_usable() { EXPLORER_UNUSABLE_PATH="$1/explorer/db"; return 1; }
+    run_setup core "$E2E_DIR" "" ""
+); RC=$?
+check_equal "e2e core unusable dir: returns 0" 0 "$RC"
+check_file_has "e2e core unusable dir: warning" "$TMP/out" "Warning: cannot write to $E2E_DIR/explorer/db; Explorer not started"
+check_file_lacks "e2e core unusable dir: Explorer not started" "$SHIM_LOG" "compose up -d influxdb3-explorer"
+check_file_has "e2e core unusable dir: cause" "$TMP/out" "Another user owns $E2E_DIR/explorer/db, so Explorer, which runs as your user, cannot use it."
+check_file_has "e2e core unusable dir: chown step" "$TMP/out" "sudo chown -R $(id -u):$(id -g) $E2E_DIR/explorer"
+check_file_has "e2e core unusable dir: re-run step" "$TMP/out" "Run this installer again."
+check_file_lacks "e2e core unusable dir: no placeholder step" "$TMP/out" "YOUR_TOKEN_HERE"
+check_file_has "e2e core unusable dir: config kept" "$E2E_DIR/explorer/config/config.json" "$TOKEN_FIXTURE"
 
 # Back to Enterprise 3.12.1: still nothing to create
 EDITION="Enterprise"; INFLUXDB_VERSION="3.12.1"; DOCKER_IMAGE="influxdb:3.12.1-enterprise"

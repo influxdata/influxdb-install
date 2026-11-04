@@ -220,6 +220,7 @@ readonly NC='\033[0m' # No Color
 INFLUXDB_PORT=8181  # Can be changed if port is in use
 EXPLORER_PORT=8888  # Can be changed if port is in use
 readonly EXPLORER_IMAGE="influxdata/influxdb3-ui"
+readonly EXPLORER_IMAGE_UID=1500  # the image's own user, influxui; a root install keeps it
 readonly MANUAL_TOKEN_MSG="MANUAL_TOKEN_CREATION_REQUIRED"
 readonly FIRST_EXPLORER_USER="admin"  # the admin the embedded-UI path creates
 
@@ -841,6 +842,43 @@ create_docker_directories() {
 
     chmod 700 "$DOCKER_DIR/explorer/db" 2>/dev/null || true
     chmod 750 "$DOCKER_DIR/explorer/config" 2>/dev/null || true
+
+    # Root keeps the image's own user for the Explorer container (see
+    # generate_docker_compose_yaml), so that user must own the database
+    # directory; -R also repairs files an earlier run left to root
+    if [ "$(id -u)" -eq 0 ]; then
+        chown -R "$EXPLORER_IMAGE_UID:$EXPLORER_IMAGE_UID" "$DOCKER_DIR/explorer/db" 2>/dev/null || true
+    fi
+}
+
+# Checks that the installing user can use the Explorer directories. The
+# container runs as that user (see generate_docker_compose_yaml), so a
+# directory another user owns, for example after the documented
+# "chown -R 1500:1500" for the image's own user, stops Explorer with
+# "Permission denied". Root is exempt: it keeps the image's user and gives
+# it the files. Returns 1 and names the first unusable path in
+# EXPLORER_UNUSABLE_PATH.
+explorer_dirs_usable() {
+    DOCKER_DIR="$1"
+    EXPLORER_UNUSABLE_PATH=""
+
+    if [ "$(id -u)" -eq 0 ]; then
+        return 0
+    fi
+
+    for DIR_PATH in "$DOCKER_DIR/explorer/db" "$DOCKER_DIR/explorer/config"; do
+        if ! [ -r "$DIR_PATH" ] || ! [ -w "$DIR_PATH" ] || ! [ -x "$DIR_PATH" ]; then
+            EXPLORER_UNUSABLE_PATH="$DIR_PATH"
+            return 1
+        fi
+    done
+    for FILE_PATH in "$DOCKER_DIR/explorer/db"/* "$DOCKER_DIR/explorer/config/config.json"; do
+        if [ -e "$FILE_PATH" ] && ! [ -w "$FILE_PATH" ]; then
+            EXPLORER_UNUSABLE_PATH="$FILE_PATH"
+            return 1
+        fi
+    done
+    return 0
 }
 
 # --- Health Checks ---
@@ -1014,6 +1052,18 @@ generate_docker_compose_yaml() {
     USER_UID=$(id -u)
     USER_GID=$(id -g)
 
+    # The Explorer container runs as the installing user, who owns the host
+    # directories it mounts, so the file modes that keep the token private
+    # also let the container read its config and write its database. Root is
+    # the exception: the container keeps the image's own user, and
+    # create_docker_directories and configure_explorer_via_file give it the
+    # files instead, so the service never runs as uid 0.
+    EXPLORER_USER_LINE=""
+    if [ "$USER_UID" -ne 0 ]; then
+        EXPLORER_USER_LINE="
+    user: \"${USER_UID}:${USER_GID}\""
+    fi
+
     # Determine edition-specific values
     if [ "$EDITION_TYPE" = "enterprise" ]; then
         SERVICE_NAME="influxdb3-enterprise"
@@ -1061,8 +1111,7 @@ generate_docker_compose_yaml() {
         EXPLORER_SERVICE="
   influxdb3-explorer:
     image: ${EXPLORER_IMAGE}
-    container_name: influxdb3-explorer
-    user: \"${USER_UID}:${USER_GID}\"
+    container_name: influxdb3-explorer${EXPLORER_USER_LINE}
     command: [\"--mode=admin\"]
     ports:
       - \"${EXPLORER_PORT}:8080\"
@@ -1258,6 +1307,12 @@ configure_explorer_via_file() {
 EOF
 
     chmod 640 "$DOCKER_DIR/explorer/config/config.json"
+
+    # Root keeps the image's own user for the container, which must then
+    # read this file; see generate_docker_compose_yaml
+    if [ "$(id -u)" -eq 0 ]; then
+        chown "$EXPLORER_IMAGE_UID:$EXPLORER_IMAGE_UID" "$DOCKER_DIR/explorer/config/config.json" 2>/dev/null || true
+    fi
 
     return 0
 }
@@ -1650,6 +1705,9 @@ setup_docker_compose() {
     CONFIG_FILE="$DOCKER_DIR/explorer/config/config.json"
     TOKEN_IS_NEW=false
     EXPLORER_DEPLOYED=false
+    EXPLORER_TOKEN_KNOWN=false
+    EXPLORER_DIRS_UNUSABLE=false
+    EXPLORER_START_FAILED=false
 
     if [ -f "$CONFIG_FILE" ]; then
         printf "└─ Found existing Explorer config\n\n"
@@ -1675,6 +1733,9 @@ setup_docker_compose() {
 
     # Display token BEFORE launching Explorer (only if newly created)
     if [ "$TOKEN" != "$MANUAL_TOKEN_MSG" ] && [ "$TOKEN" != "TOKEN_ALREADY_EXISTS" ]; then
+        # Decided here: configure_explorer_via_file reuses TOKEN for its
+        # argument, so the value is the placeholder on the other branch
+        EXPLORER_TOKEN_KNOWN=true
         if [ "$TOKEN_IS_NEW" = true ]; then
             print_operator_token_box "$TOKEN"
         fi
@@ -1685,14 +1746,29 @@ setup_docker_compose() {
         # Pull Explorer image
         pull_docker_image "influxdb3-explorer" "InfluxDB 3 Explorer" "false"
 
-        # Configure Explorer (use port 8181 for container-to-container communication)
-        configure_explorer_via_file "$TOKEN" "http://${CONTAINER_NAME}:8181" "$SERVER_NAME" "$DOCKER_DIR"
-        docker compose up -d influxdb3-explorer 2>&1 | filter_docker_output
+        if explorer_dirs_usable "$DOCKER_DIR"; then
+            # Configure Explorer (use port 8181 for container-to-container communication)
+            configure_explorer_via_file "$TOKEN" "http://${CONTAINER_NAME}:8181" "$SERVER_NAME" "$DOCKER_DIR"
 
-        # Wait for Explorer to be ready
-        if wait_for_explorer_ready 60; then
-            EXPLORER_DEPLOYED=true
-            open_browser_url "http://localhost:${EXPLORER_PORT}/system-overview"
+            # A pipeline into the filter would report the filter's status;
+            # keep compose's own, so a container that never started is not
+            # waited for
+            UP_STATUS=0
+            UP_OUTPUT=$(docker compose up -d influxdb3-explorer 2>&1) || UP_STATUS=$?
+            if [ -n "$UP_OUTPUT" ]; then
+                printf '%s\n' "$UP_OUTPUT" | filter_docker_output
+            fi
+
+            if [ "$UP_STATUS" -ne 0 ]; then
+                EXPLORER_START_FAILED=true
+                printf "└─ ${YELLOW}Warning: the Explorer container did not start${NC}\n"
+            elif wait_for_explorer_ready 60; then
+                EXPLORER_DEPLOYED=true
+                open_browser_url "http://localhost:${EXPLORER_PORT}/system-overview"
+            fi
+        else
+            EXPLORER_DIRS_UNUSABLE=true
+            printf "└─ ${YELLOW}Warning: cannot write to %s; Explorer not started${NC}\n" "$EXPLORER_UNUSABLE_PATH"
         fi
     else
         # Token creation failed - prepare Explorer but don't start it
@@ -1735,7 +1811,20 @@ setup_docker_compose() {
     # Show manual setup instructions if Explorer was not deployed
     if [ "$EXPLORER_DEPLOYED" = false ]; then
         printf "${BOLD}To Complete InfluxDB 3 Explorer Setup:${NC}\n"
-        if [ "$TOKEN" != "$MANUAL_TOKEN_MSG" ] && [ "$TOKEN" != "TOKEN_ALREADY_EXISTS" ]; then
+        if [ "$EXPLORER_DIRS_UNUSABLE" = true ]; then
+            # Another user owns the directories, usually after a manual chown
+            # to the image's user; Explorer runs as the installing user now
+            printf "Another user owns %s, so Explorer, which runs as your user, cannot use it.\n" "$EXPLORER_UNUSABLE_PATH"
+            printf "1. Give the Explorer directories back to your user:\n"
+            printf "   ${DIM}sudo chown -R %s:%s %s/explorer${NC}\n\n" "$(id -u)" "$(id -g)" "$DOCKER_DIR"
+            printf "2. Run this installer again.\n\n"
+        elif [ "$EXPLORER_START_FAILED" = true ]; then
+            # The token is already in the config; compose reported the error above
+            printf "The Explorer container did not start.\n"
+            printf "1. Check the error above, then start it:\n"
+            printf "   ${DIM}cd %s && docker compose up -d influxdb3-explorer${NC}\n\n" "$DOCKER_DIR"
+            printf "2. Open your browser to http://localhost:${EXPLORER_PORT}\n\n"
+        elif [ "$EXPLORER_TOKEN_KNOWN" = true ]; then
             # The token is already in the config; Explorer was started but did not answer in time
             printf "Explorer did not respond within 60 seconds. It may still be starting.\n"
             printf "1. Check its status and logs:\n"
